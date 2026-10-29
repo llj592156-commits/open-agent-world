@@ -22,6 +22,9 @@ class NodeResourceContext:
     # Trusted backend code only. Values must never enter state, job parameters,
     # action responses or exports. Resolve at execution time, not when queueing.
     resolve_secret: Callable[[str], str | None] | None = None
+    # Host-supplied identity of this Agent invocation, never a tool argument.
+    # Desktop/standalone calls have no Run. Appended for positional compatibility.
+    run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -49,6 +49,10 @@ Plugin-specific documentation can remain in its own package or repository. These
 
 ## Developing a plugin
 
+Plugin API 1.34 adds optional `RelationshipDefinition.reverse_relationship` for
+different permissions on the two directions of one edge. See
+[relationships, traits, and capabilities](#relationships-traits-and-capabilities).
+
 Plugin API 1.33 adds `BackgroundJobProvider`, a host-owned durable job ledger and
 model-free observation through the shared continuation loop. Providers submit or
 attach external work; the host retains identity, authorization and continuation
@@ -302,6 +306,14 @@ then a global environment setting, then the server environment. Resolve inside
 the executing job; never put values in card state, durable job parameters,
 responses, or logs. Credential writes use host-only settings endpoints, not
 Agent capabilities. Standalone callers may omit this callback.
+
+`NodeResourceContext.run_id` is an optional, host-supplied Run identity for the
+current Agent capability invocation. It is populated only when the active Run
+belongs to the calling Agent; desktop calls and capability calls outside a Run
+receive `None`. A tool argument named `run_id` cannot override this field.
+The field is appended with a default of `None`, preserving existing positional
+constructors. It identifies the invocation only; it does not subscribe to Run
+events, query execution status, or change a plugin's business task.
 
 For native resources without a canvas snapshot, set `deletion_warning` on the
 node definition. The UI confirms permanent deletion, clears undo history after
@@ -1099,9 +1111,28 @@ changing a granting edge revokes permission for subsequent invocations, includin
 calls through a tool exposed before that change.
 
 Connection gestures are unordered. The host stores the endpoints in the canonical
-orientation defined by the relationship. A `bidirectional` edge grants the same
-relationship capabilities in reverse; use separate relationships for different
-meanings.
+orientation defined by the relationship. By default a `bidirectional` edge grants
+the same relationship capabilities in reverse, preserving existing behavior.
+
+With Plugin API 1.34, a relationship may instead declare
+`reverse_relationship="core.execution-source"` (or another registered relationship)
+and include `"bidirectional"` in `directions`. A two-way edge then uses its own
+contract from source to target and the referenced relationship's forward contract
+from target to source. Each contract's endpoint types/traits are validated; reverse
+references must resolve to an ordinary, forward-capable relationship without a
+nested reverse reference. This is a plugin declaration, not a model-selected
+permission. It does not create a second stored edge or require a database migration.
+
+For example, an Agent-to-library news relationship grants news tools forward and
+observes Agent execution in reverse. The library declares `core.execution-viewer`
+and the Agent declares `core.execution-source`. Switching the edge back to
+`forward` revokes observation while retaining news tools; deleting it revokes both.
+Existing one-way edges keep their current permissions until explicitly changed.
+The execution-source SDK and session boundaries remain unchanged. Connection
+dialogs describe both grants, and scoped canvas control/review checks both.
+The lifecycle SDK's `list_edges_from()` still returns stored, canonical edges;
+plugins enforcing their own business rules must account for their declared two-way
+relationships when inspecting that raw graph.
 
 ## Runtime providers
 
@@ -1422,3 +1453,59 @@ materialization and explicit retention release. See [lifecycle and artifact
 contracts](lifecycle-artifacts.md) for authorization, idempotency, migration and
 recovery guarantees. Ordinary document `artifacts` metadata does not grant access
 or retain file bytes.
+
+
+### Backend observation of an exact Agent Run (Plugin API 1.34)
+
+`NodeLifecycleContext.run_observations` provides `read(viewer_id, agent_id,
+run_id)` and `watch(viewer_id, agent_id, run_id, callback)`. The public types
+`ObservedRun`, `RunObservations`, and `RunSubscription` are exported from
+`open_agent_world.plugin_api`. Older/manually constructed lifecycle contexts
+may leave this optional field as `None`.
+
+The viewer must have `core.execution-viewer` and a live directed
+`core.execution-source` grant to the Agent. Composite reverse relationships
+use the same permission checks as existing execution views. The Run must belong
+to that Agent. Reads target the exact Run across sessions; they do not use the
+currently selected frontend session. No control permission is granted.
+
+`ObservedRun` contains only `run_id`, `agent_id`, `status`, `updated_at`,
+`started_at`, and `finished_at` (ISO timestamps), plus optional `error`.
+For failed Runs, `error` is a bounded, host-generated category summary (such as
+invalid model, authentication, timeout or rate limit), never the raw exception.
+Unknown errors receive a generic message directing the user to Run details.
+It excludes prompts, output, credentials, raw error detail and provider internals. Run success is not proof
+that a plugin business task completed.
+
+```python
+async def on_startup(self, context, node):
+    async def changed(run):
+        # Match the saved task attempt/run_id before updating business state.
+        # Use the plugin's existing safe persistence path for any blocking write.
+        await self.update_task(run)
+
+    self.watch = await context.run_observations.watch(
+        node.id, self.saved_agent_id, self.saved_run_id, changed)
+
+async def on_shutdown(self, context, node):
+    if self.watch:
+        await self.watch.close()
+```
+
+Registration first subscribes to EventHub and delivers an authoritative initial
+snapshot before returning the handle. It then serializes changed snapshots to
+the async callback, rechecking live grants before delivery. Permission revocation
+pauses delivery without ending the subscription. Restoring a live grant
+automatically reconciles the same Run, including terminal changes while revoked.
+Deletion stops the subscription. Callbacks must be bounded and idempotent;
+a failed later callback is logged and retried on a subsequent event/check.
+Initial callback errors propagate to the registering caller. Callbacks run under
+the host node-mutation lock; do not block or wait for other Run transitions there.
+
+EventHub is a wake-up signal, not a durable event log. The host rereads Run state
+on events and every 30 seconds to reconcile dropped events. Intermediate
+transitions may coalesce; this is current-state delivery, not exactly-once event
+replay. Subscriptions are process-local: restore saved task/run associations and
+register again at startup to reconcile restart-interrupted Runs. Close handles on
+node shutdown/removal; host shutdown also cancels remaining subscriptions. This
+SDK does not start Agents or create threads in plugins.

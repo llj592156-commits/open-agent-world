@@ -597,6 +597,15 @@ class ApplicationServices:
         default=30.0, init=False, repr=False
     )
 
+    _run_observations: Any = field(default=None, init=False, repr=False)
+
+    @property
+    def run_observations(self):
+        if self._run_observations is None:
+            from backend.run_observation import RunObservationService
+            self._run_observations = RunObservationService(self)
+        return self._run_observations
+
     @property
     def execution_credentials(self):
         from backend.security.execution_credentials import ExecutionCredentialStore
@@ -776,6 +785,8 @@ class ApplicationServices:
             if lifecycle is not None:
                 await lifecycle.on_shutdown(context, card)
         await self._require_run_manager().shutdown()
+        if self._run_observations is not None:
+            await self._run_observations.shutdown()
         if self.node_execution.continuation_outputs:
             await asyncio.gather(*tuple(self.node_execution.continuation_outputs), return_exceptions=True)
 
@@ -3877,6 +3888,7 @@ class ApplicationServices:
     def _node_lifecycle_context(self) -> NodeLifecycleContext:
         manager = self._require_run_manager()
         return NodeLifecycleContext(
+            run_observations=self.run_observations,
             nodes=_LifecycleNodes(self.world),
             resources=_LifecycleResources(self.resources),
             conversations=_LifecycleConversations(self.conversations, self.state),

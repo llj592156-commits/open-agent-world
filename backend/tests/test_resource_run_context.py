@@ -56,6 +56,9 @@ async def setup(services):
 def test_existing_positional_context_constructor_remains_compatible(tmp_path):
     context = NodeResourceContext('card', tmp_path, Event(), 'agent', True, None, None)
     assert context.actor_id == 'agent' and context.confirmed is True and context.run_id is None
+    resolver = lambda reference: reference
+    upstream = NodeResourceContext('card', tmp_path, Event(), 'agent', False, None, None, resolver)
+    assert upstream.resolve_model is resolver and upstream.run_id is None
 
 
 @pytest.mark.asyncio

@@ -112,7 +112,7 @@ Connection gestures are unordered. The host stores the endpoints in the canonica
 orientation defined by the relationship. By default a `bidirectional` edge grants
 the same relationship capabilities in reverse, preserving existing behavior.
 
-With Plugin API 1.41, a relationship may instead declare
+With Plugin API 1.42, a relationship may instead declare
 `reverse_relationship="core.execution-source"` (or another registered relationship)
 and include `"bidirectional"` in `directions`. A two-way edge then uses its own
 contract from source to target and the referenced relationship's forward contract

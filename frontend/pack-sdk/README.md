@@ -86,3 +86,9 @@ admission uncertain. Store the receipt's `run_id` with the current business
 attempt when later execution observations need an exact association.
 Execution-source reads still require their existing connection permissions;
 the receipt does not grant observation access or subscribe a plugin backend.
+
+Plugin API 1.41 adds `Tooltip` and `Popover` with host theme tokens, native top-layer
+positioning and keyboard dismissal. They preserve trigger layout, refs and event
+handlers. Use `Tooltip` for noninteractive hints and `Popover` for small interactive
+panels. Declare the matching adapter/manifest minimum; see the workspace design
+guide for examples and focus behavior.

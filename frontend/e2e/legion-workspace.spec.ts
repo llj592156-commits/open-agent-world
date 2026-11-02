@@ -1,4 +1,103 @@
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
+
+test.describe('compact workspace', () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+  test('uses full-width view navigation and keeps drafts and desktop layout through rotation', async ({ page, request }) => {
+    test.setTimeout(45_000);
+    const { cards, group } = await setup(request);
+    const layout = { version: 2, hidden_sections: [], root: { kind: 'split', axis: 'horizontal', ratio: .35,
+      first: { kind: 'pane', view: { card_id: cards[0].id } }, second: { kind: 'pane', view: { card_id: cards[1].id } } } };
+    expect((await request.patch(`/api/nodes/${group.id}`, { data: { config: { workspace_layout: layout } } })).ok()).toBe(true);
+    const profile = await (await request.get('/api/application')).json();
+    expect((await request.patch('/api/application/preferences', { data: {
+      profile_id: profile.profile_id, generation: profile.generation,
+      changes: { 'oaw-active-workspace-v1': JSON.stringify({ state: { activeId: group.id }, version: 0 }) },
+    } })).ok()).toBe(true);
+    const layoutWrites: string[] = [];
+    page.on('request', request => {
+      if (request.method() === 'PATCH' && request.url().endsWith(`/api/nodes/${group.id}`)) layoutWrites.push(request.postData() ?? '');
+    });
+    await page.goto('/');
+    const workspace = page.getByRole('dialog', { name: 'Project studio workspace mode' });
+    // This can be the first full-app load while Vite transforms the editor bundle.
+    await expect(workspace).toHaveAttribute('data-compact', 'true', { timeout: 20_000 });
+    const picker = workspace.getByRole('combobox', { name: 'Workspace views', exact: true });
+    const draft = workspace.getByRole('textbox', { name: 'Contents', exact: true });
+    await draft.fill('Phone draft survives switching.');
+    await picker.tap();
+    await page.getByRole('listbox', { name: 'Workspace views', exact: true }).getByRole('option', { name: 'Conversation', exact: true }).tap();
+    await expect(draft).toBeHidden();
+    await picker.tap();
+    await page.getByRole('listbox', { name: 'Workspace views', exact: true }).getByRole('option', { name: 'Project notes', exact: true }).tap();
+    await expect(draft).toHaveValue('Phone draft survives switching.');
+    await expect(workspace.locator('.legion-workspace-pane:visible')).toHaveCount(1);
+    expect(await workspace.locator('.legion-layout-stage').evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    await page.screenshot({ path: 'test-results/compact-workspace-phone.png', animations: 'disabled' });
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await expect(workspace).not.toHaveAttribute('data-compact', 'true');
+    await expect(workspace.locator('.legion-workspace-pane:visible')).toHaveCount(2);
+    await expect(draft).toHaveValue('Phone draft survives switching.');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(workspace.locator('.legion-workspace-pane:visible')).toHaveCount(1);
+    await expect(draft).toHaveValue('Phone draft survives switching.');
+    expect(layoutWrites).toEqual([]);
+    expect((await (await request.get(`/api/nodes/${group.id}`)).json()).config.workspace_layout).toEqual(layout);
+    await workspace.getByRole('button', { name: 'Back to canvas', exact: true }).tap();
+    await page.getByRole('button', { name: 'World menu', exact: true }).tap();
+    await page.getByRole('button', { name: 'Workspaces', exact: true }).tap();
+    await page.getByRole('dialog', { name: 'Workspaces', exact: true }).getByRole('button', { name: 'Project studio', exact: true }).tap();
+    await expect(workspace).toHaveAttribute('data-compact', 'true');
+  });
+});
+
+test('switches canvas workspaces and publishes their selected menu order', async ({ page, request }) => {
+  const { cards, group } = await setup(request);
+  const layout = (cardId: string) => ({ version: 2, root: { kind: 'pane', view: { card_id: cardId } } });
+  expect((await request.patch(`/api/nodes/${group.id}`, { data: { config: { workspace_layout: layout(cards[0].id) } } })).ok()).toBe(true);
+  const note = await (await request.post('/api/nodes', { data: { type: 'text', name: 'Operations guide', content: 'Operations workspace content' } })).json();
+  const grouped = await (await request.post('/api/legion-groups', { data: { name: 'Operations', node_ids: [note.id] } })).json();
+  const operations = grouped.find((card: { type: string }) => card.type === 'legion');
+  expect((await request.patch(`/api/nodes/${operations.id}`, { data: { config: { workspace_layout: layout(note.id) } } })).ok()).toBe(true);
+  await page.goto('/');
+  let workspace = await openWorkspace(page, group.id);
+  await workspace.getByRole('button', { name: 'Switch workspace' }).click();
+  await expect(page.getByRole('menuitemradio')).toHaveText(['Project studio', 'Operations']);
+  await page.screenshot({ path: '../.tmp/builder-workspace-switcher.png', fullPage: true });
+  await page.getByRole('menuitemradio', { name: 'Operations' }).click();
+  workspace = page.getByRole('dialog', { name: 'Operations workspace mode' });
+  await expect(workspace.locator('.text-editor:visible')).toHaveValue('Operations workspace content');
+  await workspace.getByRole('button', { name: 'Publish application' }).click();
+  const publish = page.getByRole('dialog', { name: 'Publish application', exact: true });
+  await publish.getByRole('checkbox', { name: 'Project studio' }).check();
+  await publish.getByRole('button', { name: 'Move Project studio up' }).click();
+  await expect(publish.getByRole('button', { name: 'Create release' })).toBeEnabled();
+  await page.screenshot({ path: '../.tmp/publish-workspace-order.png', fullPage: true });
+  const published = page.waitForResponse(response => response.url().endsWith('/api/deployments') && response.request().method() === 'POST');
+  await publish.getByRole('button', { name: 'Create release' }).click();
+  const release = await (await published).json();
+  expect(release.workspaces.map((item: { legion_id: string }) => item.legion_id)).toEqual([group.id, operations.id]);
+  await publish.getByRole('button', { name: 'Close', exact: true }).click();
+  await workspace.getByRole('button', { name: 'Switch workspace' }).click();
+  await page.getByRole('menuitemradio', { name: 'Project studio' }).click();
+  await page.reload();
+  await expect(page.getByRole('dialog', { name: 'Project studio workspace mode' })).toBeVisible();
+  const trigger = page.getByRole('button', { name: 'Switch workspace' });
+  await trigger.press('ArrowDown');
+  await page.getByRole('menuitemradio', { name: 'Project studio' }).press('End');
+  await expect(page.getByRole('menuitemradio', { name: 'Operations' })).toBeFocused();
+  await page.getByRole('menuitemradio', { name: 'Operations' }).press('Enter');
+  await expect(page.getByRole('dialog', { name: 'Operations workspace mode' })).toBeVisible();
+  await page.getByRole('dialog', { name: 'Operations workspace mode' }).getByRole('button', { name: 'Use dark theme' }).click();
+  await trigger.click();
+  await page.screenshot({ path: '../.tmp/builder-workspace-switcher-dark.png', fullPage: true, animations: 'disabled' });
+  await page.getByRole('menuitemradio', { name: 'Operations' }).press('Escape');
+  await expect(page.getByRole('menu')).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await page.locator('.legion-layout-stage').click({ position: { x: 500, y: 450 } });
+  await expect(page.getByRole('menu')).toHaveCount(0);
+});
 
 for (const nestedAxis of ['horizontal', 'vertical']) test(`resizing nested ${nestedAxis} workspace regions fills the stage without expanding it`, async ({ page, request }) => {
   await page.setViewportSize({ width: 1400, height: 900 });
@@ -88,6 +187,14 @@ async function openWorkspace(page: Page, id: string) {
   return workspace;
 }
 
+// A desktop split can make an individual card narrow enough to use its local
+// compact navigation. Reach sections through that visible control before acting.
+async function showCompactView(owner: Locator, navigationName: string, name: string) {
+  await expect(owner).toBeVisible();
+  const navigation = owner.getByRole('navigation', { name: navigationName, exact: true });
+  if (await navigation.isVisible()) await navigation.getByRole('button', { name, exact: true }).click();
+}
+
 test.afterEach(async ({ request }) => {
   const nodes = await (await request.get('/api/nodes')).json();
   if (nodes.length) expect((await request.post('/api/nodes/batch-delete', { data: { node_ids: nodes.map((node: { id: string }) => node.id) } })).ok()).toBe(true);
@@ -132,6 +239,7 @@ test('live card sections detach, hide, restore and persist with their original o
   await inline.getByRole('button', { name: 'Arrange Conversation', exact: true }).click();
   await window.getByRole('button', { name: 'Dock right: Conversation', exact: true }).click();
   const participants = owner.locator('[data-workspace-section="participants"]');
+  await showCompactView(owner, 'Conversation views', 'Participants');
   await participants.hover();
   await participants.getByRole('button', { name: 'Hide Participants', exact: true }).click();
   await expect(window.getByRole('region', { name: 'Hidden sections', exact: true }).getByRole('button', { name: 'Restore Participants to card', exact: true })).toBeVisible();
@@ -140,6 +248,7 @@ test('live card sections detach, hide, restore and persist with their original o
   await window.locator(`[data-workspace-source="${sandbox.id}"]`).click();
   await owner.getByRole('button', { name: 'Add selected card as tab', exact: true }).click();
   const sandboxOwner = window.locator(`[data-workspace-pane="${sandbox.id}"]`);
+  await showCompactView(sandboxOwner, 'Workspace views', 'Terminal');
   await sandboxOwner.getByRole('tab', { name: 'History', exact: true }).click();
   const terminal = sandboxOwner.locator('[data-workspace-section="terminal"]');
   await terminal.hover();
@@ -180,6 +289,7 @@ test('live card sections detach, hide, restore and persist with their original o
   await hiddenSections.getByRole('button', { name: 'Restore Participants to card', exact: true }).click();
   await expect(hiddenSections).toHaveCount(0);
   await window.locator('.legion-pane-tabs').getByRole('tab', { name: 'Conversation', exact: true }).click();
+  await showCompactView(owner, 'Conversation views', 'Participants');
   await expect(owner.locator('[data-workspace-section="participants"]')).toBeVisible();
   await window.getByRole('button', { name: 'Done editing', exact: true }).click();
   expect((await (await request.get(`/api/nodes/${group.id}`)).json()).config.workspace_layout.hidden_sections).toEqual([]);
@@ -200,6 +310,7 @@ test('an unplaced card can expose a section without placing or duplicating the w
   await window.getByRole('button', { name: 'Edit layout', exact: true }).click();
   await window.getByRole('navigation', { name: 'Unplaced workspace cards' }).getByRole('button', { name: 'Sandbox', exact: true }).click();
   const drawer = window.getByRole('region', { name: 'Unplaced card details', exact: true });
+  await showCompactView(drawer, 'Workspace views', 'Terminal');
   await drawer.getByRole('tab', { name: 'History', exact: true }).click();
   const terminal = drawer.locator('[data-workspace-section="terminal"]');
   await terminal.hover();

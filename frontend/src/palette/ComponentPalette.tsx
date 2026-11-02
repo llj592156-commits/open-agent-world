@@ -1,18 +1,18 @@
-import { CardFace, CardStock } from "../components/CardFace";
-import { normalizeCardFinish } from "../cards/cardFinish";
+import { LibraryCardSurface } from "../shell/LibraryCard";
 import { t, useLocale } from "../i18n";
-import { AlertTriangle, Layers3, LibraryBig, Pencil, Plus, Save, Trash2, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronUp, LibraryBig, Pencil, Plus, Save, Trash2, X } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { DECK_ICONS, DeckIcon } from "../components/DeckIcon";
 import { DeckHand } from "./DeckHand";
 import type { PaletteDragPayload } from "./dragPayload";
 import { useWorldStore } from "../state/worldStore";
-import { collectedLibraryLegions, displayDeckName } from "../shell/libraryCatalog";
+import { collectedLibraryCards, collectedLibraryLegions, displayDeckName } from "../shell/libraryCatalog";
 import { useCardLibrary } from "../state/cardLibrary";
-import { CatalogIcon } from "../components/CatalogIcon";
 import { useEquipmentDrag } from "../state/equipment";
 import { buildCardDraft } from "../state/helpers";
 import { startPalettePointerDrag, usePaletteDropTarget, type PalettePointerItem } from "./pointerDrag";
+import { useInteractionEnvironment } from '../interaction/environment';
+import './touchPalette.css';
 
 // Compatibility helpers have no role in ongoing deck population.
 export { defaultDecks, normalizeDecks } from "./legacyDecks";
@@ -20,6 +20,11 @@ export { defaultDecks, normalizeDecks } from "./legacyDecks";
 export function ComponentPalette() {
   useLocale();
   const library = useCardLibrary();
+  const touch = useInteractionEnvironment(state => state.touch);
+  const compact = useInteractionEnvironment(state => state.compact);
+  const explicitTray = touch || compact;
+  const [expanded, setExpanded] = useState(false);
+  const [mouseInside, setMouseInside] = useState(false);
   const [editingDeck, setEditingDeck] = useState<"create" | "edit" | null>(null);
   const deckNameInput = useRef<HTMLInputElement>(null);
   useEffect(() => { if (editingDeck) deckNameInput.current?.focus({ preventScroll: true }); }, [editingDeck]);
@@ -37,8 +42,17 @@ export function ComponentPalette() {
   const cancelPointer = useRef<() => void>();
   const suppressClick = useRef(false);
   const dragged = useRef<{ kind: "node" | "legion"; id: string; sourceDeckId?: string }>();
+  const stageExpanded = expanded || (!compact && mouseInside) || editingDeck !== null;
   const endDrag = () => { dragged.current = undefined; setTrashActive(false); setDropDeck(undefined); useEquipmentDrag.getState().set(); };
   useEffect(() => { void library.refresh(); }, [library.refresh]);
+  useEffect(() => {
+    if (!explicitTray || !expanded || editingDeck || library.open) return;
+    const outside = (event: PointerEvent) => {
+      if (!root.current?.contains(event.target as Node)) setExpanded(false);
+    };
+    document.addEventListener('pointerdown', outside, true);
+    return () => document.removeEventListener('pointerdown', outside, true);
+  }, [explicitTray, expanded, editingDeck, library.open]);
   useEffect(() => {
     const element = root.current;
     const shell = element?.closest<HTMLElement>('.world-shell');
@@ -58,7 +72,7 @@ export function ComponentPalette() {
     return () => { observer.disconnect(); window.removeEventListener('resize', measure); shell.style.removeProperty('--library-deck-space'); };
   }, [library.open]);
   const snapshot = library.snapshot;
-  const formationCards = snapshot ? collectedLibraryLegions(snapshot, legions) : [];
+  const cards = snapshot ? [...collectedLibraryCards(snapshot), ...collectedLibraryLegions(snapshot, legions)] : [];
   const deck = snapshot?.decks.find(item => item.id === snapshot.active_deck_id);
   useEffect(() => () => cancelPointer.current?.(), [deck?.id]);
   const moveToDeck = async (id: string, entry: PalettePointerItem['entry']) => {
@@ -97,21 +111,29 @@ export function ComponentPalette() {
       else if (point.target.closest(".deck-trash")) void discard();
     },
   });
-  return <aside ref={root} className={`component-palette ${library.open ? 'is-library-open' : ''}`} aria-label={t("Active card deck")} data-tutorial="deck"
+  return <aside ref={root} className={`component-palette ${library.open ? 'is-library-open' : ''} ${explicitTray ? 'is-touch' : ''} ${stageExpanded ? 'is-touch-expanded' : ''}`} aria-label={t("Active card deck")} data-tutorial="deck"
+    onPointerEnter={event => setMouseInside(!compact && event.pointerType === 'mouse')}
+    onPointerLeave={() => setMouseInside(false)}
     style={{ "--deck-tab-count": (snapshot?.decks.length ?? 0), "--deck-hand-count": deck?.entries.length ?? 0 } as CSSProperties}>
     <div className="deck-tabs">
       <div className="deck-tab-scroll" role="tablist" aria-label={t("Card decks")}>
         {snapshot?.decks.map(item => <button type="button" role="tab" key={item.id} data-deck-destination={item.id} aria-selected={item.id === deck?.id}
           aria-controls="active-card-deck" className={`${item.id === deck?.id ? "is-active" : ""} ${dropDeck === item.id ? "is-drop-target" : ""}`} disabled={library.busy}
           onFocus={event => event.currentTarget.scrollIntoView({ block: "nearest", inline: "nearest" })}
-          onClick={() => { setEditingDeck(null); void library.edit({ action: "activate_deck", id: item.id }); }}>
+          onClick={() => { setEditingDeck(null); if (explicitTray) setExpanded(true); void library.edit({ action: "activate_deck", id: item.id }); }}>
           <span className="deck-tab-summary"><DeckIcon icon={item.icon} /><small>{item.entries.length}</small></span>
           <span className="deck-tab-label">{displayDeckName(item)}</span>
         </button>)}
       </div>
+      {explicitTray && <button type="button" className="deck-tool-button deck-expand-button" disabled={editingDeck !== null}
+        aria-label={t(stageExpanded ? 'Collapse card deck' : 'Expand card deck')} aria-expanded={stageExpanded} aria-controls="active-card-deck"
+        onClick={() => { setMouseInside(false); setExpanded(!stageExpanded); }}>
+        {stageExpanded ? <ChevronDown size={18} /> : <ChevronUp size={18} />}
+      </button>}
       <button type="button" className={`deck-tool-button deck-add-button ${editingDeck === "create" ? "is-active" : ""}`} onClick={() => { setDeckName(""); setDeckIcon("folder"); setEditingDeck("create"); }} aria-label={t("Create a new card deck")} aria-expanded={editingDeck === "create"} title={t("Create a new deck")}><Plus size={16} /></button>
     </div>
-    <div className={`deck-stage ${editingDeck ? "is-editor" : ""} ${dropDeck === deck?.id ? 'is-drop-target' : ''}`} data-deck-destination={!editingDeck ? deck?.id : undefined} id="active-card-deck" role="tabpanel">
+    <div className={`deck-stage ${editingDeck ? "is-editor" : ""} ${dropDeck === deck?.id ? 'is-drop-target' : ''}`} data-deck-destination={!editingDeck ? deck?.id : undefined} id="active-card-deck" role="tabpanel"
+      aria-hidden={explicitTray && !stageExpanded && !library.open ? true : undefined}>
       {editingDeck ? <form className="deck-editor" onSubmit={async event => {
         event.preventDefault();
         if (!deckName.trim()) return;
@@ -125,7 +147,7 @@ export function ComponentPalette() {
         {editingDeck === "edit" && <button type="button" className="deck-delete-button" disabled={library.busy || !deck || (snapshot?.decks.length ?? 0) < 2} title={t("Deleting a deck keeps its cards in your collection.")} onClick={async () => { if (deck && await library.edit({ action: "delete_deck", id: deck.id })) setEditingDeck(null); }}><Trash2 size={12} />{t("Delete deck")}</button>}
         {library.error ? <small role="alert">{library.error}</small> : null}
       </form> : <>
-      <div className="deck-caption"><span><DeckIcon icon={deck?.icon} size={13} /> {deck ? displayDeckName(deck) : t("Your deck")}</span><small>{t(library.open ? "Drop cards here to add" : "Drag into the world")}</small>
+      <div className="deck-caption"><span><DeckIcon icon={deck?.icon} size={13} /> {deck ? displayDeckName(deck) : t("Your deck")}</span><small>{t(library.open ? "Drop cards here to add" : touch ? 'Swipe · tap to place · drag up' : "Drag into the world")}</small>
         <div className="deck-current-actions">
         <div className={`deck-trash ${trashActive ? "is-active" : ""}`} role="region" aria-label={t("Discard card")}
           title={t("Drop to remove from this deck")} aria-busy={removing}><Trash2 size={18} /><span className="deck-trash-hint" aria-hidden="true">{t("Drop to remove from this deck")}</span></div>
@@ -134,18 +156,21 @@ export function ComponentPalette() {
       </div>
       {library.error ? <button className="deck-library-error" onClick={library.show}><AlertTriangle size={13} /> {t("Library needs attention")}</button> : null}
       {deck?.entries.some(entry => entry.kind === "legion") && legionError ? <small role="alert">{legionError}</small> : null}
-      {deck?.entries.length ? <DeckHand key={deck.id} className={`palette-items ${deck.entries.length > 2 ? "has-many" : ""}`}
+      {deck?.entries.length ? <DeckHand key={deck.id} flat={explicitTray} className={`palette-items ${deck.entries.length > 2 ? "has-many" : ""}`}
         style={{ "--deck-card-count": deck.entries.length } as CSSProperties}>
         {deck.entries.map(entry => {
           const definition = entry.kind === "node" ? snapshot?.card_definitions[entry.id] : undefined;
           const legion = entry.kind === "legion" ? legions.find(item => item.id === entry.id) : undefined;
-          const artworkUrl = entry.kind === "legion" ? formationCards.find(card => card.id === entry.id)?.artworkUrl : undefined;
           const available = entry.kind === "node" ? snapshot?.available_card_ids.includes(entry.id) : legion?.compatible;
-          const label = definition ? t(entry.id === "xrd.match" ? "XRD 谱解析" : definition.label) : legion?.name ?? entry.id;
+          const card = cards.find(item => item.kind === entry.kind && item.id === entry.id) ?? {
+            ...entry, definition, label: definition ? t(definition.label) : legion?.name ?? entry.id,
+            description: definition ? t(definition.description) : t(legion?.preset ? "Preset formation" : "Saved formation"),
+          };
+          const label = card.label;
           const payload: PaletteDragPayload = entry.kind === "node" ? { version: 1, kind: "node", type: entry.id }
             : { version: 1, kind: "legion", id: entry.id, revision: legion?.revision ?? 0 };
           return <button type="button" key={`${entry.kind}:${entry.id}`} className="deck-hover-button" data-palette-card={entry.id} data-legion-preview={legion?.id} data-unavailable={!available}
-            draggable={false} onPointerDown={event => {
+            disabled={removing || library.busy} draggable={false} onPointerDown={event => {
               if (removing || library.busy || event.button !== 0 || !event.isPrimary) return;
               suppressClick.current = false;
               const draggedEntry = { ...entry, sourceDeckId: deck.id };
@@ -159,6 +184,7 @@ export function ComponentPalette() {
                     });
                   },
                   end: endDrag,
+                  cancelClick: () => { suppressClick.current = true; },
                   discardTarget: () => !useCardLibrary.getState().busy && !removing
                     ? root.current?.querySelector<HTMLElement>('.deck-trash') ?? null : null,
                 });
@@ -167,14 +193,13 @@ export function ComponentPalette() {
               if (dragged.current) { event.preventDefault(); return; }
               if (suppressClick.current && event.detail !== 0) { suppressClick.current = false; event.preventDefault(); return; }
               if (!available) { library.inspect(entry); return; }
-              if (!library.open) entry.kind === "node" ? void createCard(entry.id) : void instantiateLegion(entry.id);
+              if (!library.open) {
+                entry.kind === "node" ? void createCard(entry.id) : void instantiateLegion(entry.id);
+                if (explicitTray) setExpanded(false);
+              }
             }}
             aria-label={available ? t("Place {v0}", { v0: String(label) }) : t("{v0} unavailable", { v0: String(label) })} title={legion ? undefined : available ? (definition ? t(definition.description) : undefined) : t("Content unavailable. Inspect it in the Library.")}>
-            <CardStock finish={entry.kind === "node" ? normalizeCardFinish(snapshot?.collection[entry.id]?.finish) : undefined}
-              style={{ "--collection-color": definition?.color ?? "#78967b" } as CSSProperties} className={`palette-item palette-item--${entry.kind === "node" ? entry.id : "legion"}`} data-deck-visual>
-              <CardFace definition={definition} imageUrl={artworkUrl} imageAlt={label} variant={artworkUrl ? "image" : undefined} icon={available ? definition ? <CatalogIcon definition={definition} /> : <Layers3 /> : <AlertTriangle />} label={label}
-                description={available ? (definition ? t(definition.description) : undefined) ?? t(legion?.preset ? "Preset formation" : "Saved formation") : t("Unavailable")} />
-            </CardStock>
+            <LibraryCardSurface card={card} className={`palette-item palette-item--${entry.kind === "node" ? entry.id : "legion"}`} data-deck-visual />
           </button>;
         })}
       </DeckHand> : <div className="deck-empty"><LibraryBig size={22} /><strong>{snapshot ? t("Build your deck") : t("Loading your deck")}</strong>

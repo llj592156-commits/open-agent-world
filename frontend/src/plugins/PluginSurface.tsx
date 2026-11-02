@@ -62,9 +62,15 @@ export function PluginSurface({ card, slot, level, children }: {
   const sessionId = useCardStateSession(card.id);
   const inWorkspace = useContext(WorkspaceSurfaceContext);
   const navigation = useWorkspaceNavigation();
-  const executionSources = useExecutionSources(card.id, access.deployed);
+  // Deployed requests use /runtime-app/workspace; its server validates both the
+  // owning card and every connected source (test_default_publication.py).
+  const executionSources = useExecutionSources(card.id, access.deployed && !(card.id in access.permissions));
   const covered = useLegionWorkspace(s => Boolean(s.activeId));
   const definition = useWorldStore((s) => s.catalog.node_types.find((d) => d.id === card.type));
+  // Catalog refreshes replace definitions. Rebind the host only when its capabilities change,
+  // so views depending on SDK callbacks keep their loaded content and local edits.
+  const stateless = definition?.state?.mode === 'none';
+  const configurablePersistence = Boolean(definition?.state?.mode === 'scoped' && definition.state.userConfigurable && definition.state.supportedScopes.length > 1);
   const runtime = useWorldStore((s) => definition ? s.catalog.frontend_modules?.[definition.plugin_id] : undefined);
   const updateCard = useWorldStore((s) => s.updateCard);
   const source = useWorldStore(s=>xrdCanvasSource(card,s.cards,s.edges));
@@ -101,13 +107,13 @@ export function PluginSurface({ card, slot, level, children }: {
         return useNodeSurfaceStore.subscribe((state, previous) => { if (state.drafts[key] !== previous.drafts[key]) listener(); });
       },
     },
-    state: access.deployed || definition?.state?.mode === 'none' ? undefined : {
+    state: (access.deployed && !(card.id in access.permissions)) || stateless ? undefined : {
       get: () => worldApi.cardState(card.id, 'GET', undefined, undefined, sessionId ?? null),
       set: (value, revision) => worldApi.cardState(card.id, 'PUT', value, revision, sessionId ?? null),
       update: (value, revision) => worldApi.cardState(card.id, 'PATCH', value, revision, sessionId ?? null),
       delete: (revision) => worldApi.cardState(card.id, 'DELETE', undefined, revision, sessionId ?? null),
     },
-    setDataPersistence: !access.deployed && definition?.state?.mode === 'scoped' && definition.state.userConfigurable && definition.state.supportedScopes.length > 1
+    setDataPersistence: !access.deployed && configurablePersistence
       ? async value => { await updateCard(card.id, { state_scope: value }); } : undefined,
     deployment: access.plugin_access?.[card.id],
     ...multiphaseHost(source ?? card.id),
@@ -143,7 +149,7 @@ export function PluginSurface({ card, slot, level, children }: {
           await worldApi.editCardLibrary({action:'open_pack', id:'research.xrd.default', expected_revision:library.revision});
         }
         const origin = world.nodes.find(n => n.id === card.id);
-        target = await state.createCard(type, {x:(origin?.position.x ?? 0)+1600, y:(origin?.position.y ?? 0)+(type === 'xrd.structure-canvas' ? 650 : 0)});
+        target = await state.createCard(type, {x:(origin?.position.x ?? 0)+1600, y:(origin?.position.y ?? 0)+(type === 'xrd.structure-canvas' ? 650 : 0)}, { parent_id: origin?.parent_id });
         if (!target) throw new Error('无法创建画布');
         await state.updateCard(target.id, {name, config:{source_node_id:card.id}}, {throwOnError:true});
       }
@@ -172,7 +178,7 @@ export function PluginSurface({ card, slot, level, children }: {
       let canvas=current?.type==='xrd.spectrum-canvas'?current:world.nodes.find(n=>n.type==='xrd.spectrum-canvas' &&
         (n.config.source_node_id===owner!.id || world.edges.some(e=>e.relationship==='xrd.frames'&&e.source===owner!.id&&e.target===n.id)));
       if(!canvas){
-        canvas=await state.createCard('xrd.spectrum-canvas',owner.position)??undefined;
+        canvas=await state.createCard('xrd.spectrum-canvas',owner.position,{parent_id:owner.parent_id})??undefined;
         if(!canvas)throw Error('无法创建谱画布');
         await state.updateCard(canvas.id,{config:{source_node_id:owner.id},parent_id:owner.parent_id},{throwOnError:true});
       }
@@ -213,7 +219,7 @@ export function PluginSurface({ card, slot, level, children }: {
       }
       if (!target) {
         const origin = nodes.find(node => node.id === card.id);
-        target = await state.createCard(type, { x: (origin?.position.x ?? 0) + 1100, y: origin?.position.y ?? 0 });
+        target = await state.createCard(type, { x: (origin?.position.x ?? 0) + 1100, y: origin?.position.y ?? 0 }, { parent_id: origin?.parent_id });
         if (!target) throw new Error("无法创建结构节点");
         try {
           const document = await worldApi.getNodeDocument(target.id);
@@ -235,7 +241,7 @@ export function PluginSurface({ card, slot, level, children }: {
       state.selectCards([target.id], { syncCanvas: true });
     },
     clearOpenedFile: () => useOpenFiles.getState().clear(card.id),
-  }), [card.id, card.state_scope, source, updateCard, access, definition, sessionId, inWorkspace, navigation, executionSources]);
+  }), [card.id, card.state_scope, source, updateCard, access, stateless, configurablePersistence, sessionId, inWorkspace, navigation, executionSources]);
   const reference = definition?.frontend?.[slot];
   if (covered && !inWorkspace && card.type.startsWith('xrd.')) return null;
   if (!reference || !definition) return <>{children}</>;

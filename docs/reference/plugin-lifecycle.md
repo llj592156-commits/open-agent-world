@@ -293,7 +293,7 @@ Manifest contributions can be combined with advanced registration in one atomic
 collector; see [mixed contributions](../developers/declarative-packs.md#mixed-contributions-api-138).
 
 
-## Backend Run observation (API 1.41)
+## Backend Run observation (API 1.42)
 
 `NodeLifecycleContext.run_observations` provides `read(viewer_id, agent_id,
 run_id)` and `watch(viewer_id, agent_id, run_id, callback)`. The public types

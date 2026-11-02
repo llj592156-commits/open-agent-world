@@ -8,12 +8,16 @@ Use the minimum version required by every API your Pack calls. Older feature
 levels remain compatible unless the contract explicitly states otherwise. The
 following requirements are API facts, not desktop release availability.
 
-Plugin API 1.41 adds optional `RelationshipDefinition.reverse_relationship` for
+Plugin API 1.42 adds optional `RelationshipDefinition.reverse_relationship` for
 asymmetric two-way grants, trusted `NodeResourceContext.run_id`, and backend
 `NodeLifecycleContext.run_observations.read/watch` for exact, permission-scoped
 Agent Run state. Subscriptions pause delivery on revocation and reconcile on
 reauthorization; failed Runs include safe category summaries. See
-[relationships](plugin-capabilities.md) and [Run observation](plugin-lifecycle.md#backend-run-observation-api-141).
+[relationships](plugin-capabilities.md) and [Run observation](plugin-lifecycle.md#backend-run-observation-api-142).
+
+Plugin API 1.41 provides shared frontend `Tooltip` and `Popover` components with
+theme tokens, top-layer positioning, viewport collision handling and keyboard
+dismissal. See [workspace design](../developers/workspace-design.md#tooltips-and-popovers-plugin-api-141).
 
 Plugin API 1.40 provides `CapabilityContext.read_artifact_file(capability, collection_id,
 version_id, path, max_bytes=...)` for trusted plugin handlers to consume an authorized

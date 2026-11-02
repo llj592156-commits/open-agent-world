@@ -87,6 +87,16 @@ attempt when later execution observations need an exact association.
 Execution-source reads still require their existing connection permissions;
 the receipt does not grant observation access or subscribe a plugin backend.
 
+This exposes the backend's existing admission response; it does not add a new
+launch endpoint or wait for a final result. Since Plugin API 1.42, plugin callers
+must handle rejected launch promises themselves. The native Agent button keeps
+its existing error toast; the plugin path does not add that native-button toast.
+Calls that simply await and ignore a successful return can keep doing so.
+Custom host implementations, test doubles, or explicit `Promise<void>` typings
+must return/type the receipt instead. Declare the corresponding minimum Plugin
+API when requiring this behavior.
+
+
 Plugin API 1.41 adds `Tooltip` and `Popover` with host theme tokens, native top-layer
 positioning and keyboard dismissal. They preserve trigger layout, refs and event
 handlers. Use `Tooltip` for noninteractive hints and `Popover` for small interactive

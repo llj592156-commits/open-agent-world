@@ -220,5 +220,8 @@ current Agent capability invocation. It is populated only when the active Run
 belongs to the calling Agent; desktop calls and capability calls outside a Run
 receive `None`. A tool argument named `run_id` cannot override this field.
 The field is appended with a default of `None`, preserving existing positional
-constructors. It identifies the invocation only; it does not subscribe to Run
+constructors, including the existing eighth `resolve_model` argument. The host
+reads the active invocation before dispatching the synchronous resource handler
+to its worker; concurrent Runs receive their own identities. It identifies the
+invocation only; it does not subscribe to Run
 events, query execution status, or change a plugin's business task.

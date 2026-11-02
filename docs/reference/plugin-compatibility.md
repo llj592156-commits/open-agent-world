@@ -8,12 +8,12 @@ Use the minimum version required by every API your Pack calls. Older feature
 levels remain compatible unless the contract explicitly states otherwise. The
 following requirements are API facts, not desktop release availability.
 
-Plugin API 1.42 adds optional `RelationshipDefinition.reverse_relationship` for
-asymmetric two-way grants, trusted `NodeResourceContext.run_id`, and backend
-`NodeLifecycleContext.run_observations.read/watch` for exact, permission-scoped
-Agent Run state. Subscriptions pause delivery on revocation and reconcile on
-reauthorization; failed Runs include safe category summaries. See
-[relationships](plugin-capabilities.md) and [Run observation](plugin-lifecycle.md#backend-run-observation-api-142).
+Plugin API 1.42 exposes the existing Agent admission receipt through frontend
+`host.runAgent()` and propagates launch request errors to the plugin caller.
+It also adds trusted `NodeResourceContext.run_id` for Agent resource calls.
+A receipt identifies an accepted Run; it does not grant observation access or
+indicate execution/business completion. See [trusted Run identity](plugin-documents.md#trusted-run-identity-api-142)
+and the [frontend SDK guide](../../frontend/pack-sdk/README.md).
 
 Plugin API 1.41 provides shared frontend `Tooltip` and `Popover` components with
 theme tokens, top-layer positioning, viewport collision handling and keyboard

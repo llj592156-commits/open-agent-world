@@ -224,8 +224,6 @@ export interface NodeTypeCatalogItem {
 export interface RelationshipCatalogItem {
   data_read?: boolean;
   generated?: boolean;
-  /** Forward contract used in the reverse direction when this edge is two-way. */
-  reverse_relationship?: Relationship | null;
   id: Relationship;
   plugin_id: string;
   label: string;

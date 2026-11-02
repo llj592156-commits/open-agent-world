@@ -244,7 +244,6 @@ class RelationshipCatalogItem(BaseModel):
     templateable: bool
     generated: bool = False
     data_read: bool = False
-    reverse_relationship: str | None = None
 
 
 class PluginCatalog(BaseModel):
@@ -443,9 +442,6 @@ class RelationshipDefinition:
     canvas_requires_confirmation: bool = False
     # Read-only dataset access from source (consumer) to target (provider).
     data_read: bool = False
-    # When bidirectional, the opposite direction uses this relationship's
-    # forward contract. None preserves the existing symmetric behavior.
-    reverse_relationship: str | None = None
 
     def catalog_item(self, plugin_id: str) -> RelationshipCatalogItem:
         return RelationshipCatalogItem(
@@ -462,7 +458,6 @@ class RelationshipDefinition:
             templateable=self.templateable,
             generated=self.generated,
             data_read=self.data_read,
-            reverse_relationship=self.reverse_relationship,
         )
 
 
@@ -992,11 +987,6 @@ class PluginRegistry:
                 raise ValueError(
                     f"relationship {definition.id!r} has invalid directions"
                 )
-            if definition.reverse_relationship is not None:
-                reverse = staged.relationships.get(definition.reverse_relationship) or self._relationships.get(definition.reverse_relationship)
-                if ("bidirectional" not in definition.directions or definition.generated or reverse is None
-                        or reverse.generated or "forward" not in reverse.directions or reverse.reverse_relationship is not None):
-                    raise ValueError(f"relationship {definition.id!r} needs a registered, ordinary forward reverse_relationship without nesting")
             missing = [
                 grant.kind
                 for grant in definition.capabilities

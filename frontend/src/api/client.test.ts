@@ -14,18 +14,19 @@ afterEach(() => {
 });
 
 describe("API normalization boundary", () => {
-  it('returns the Agent admission receipt immediately from the existing run endpoint', async () => {
+  it.each([undefined, false, true])('returns the Agent admission receipt with freshContext=%s', async freshContext => {
     const receipt = { accepted: true, agent_id: 'agent one', run_id: 'run-1' };
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(receipt), {
       status: 202, headers: { 'content-type': 'application/json' },
     }));
     vi.stubGlobal('fetch', fetchMock);
-    expect(await worldApi.runAgent('agent one', 'Analyze the assigned articles')).toEqual(receipt);
+    expect(await worldApi.runAgent('agent one', 'Analyze the assigned articles', freshContext)).toEqual(receipt);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/agents/agent%20one/run');
     expect(init.method).toBe('POST');
-    expect(JSON.parse(init.body)).toEqual({ prompt: 'Analyze the assigned articles' });
+    expect(JSON.parse(init.body)).toEqual({ prompt: 'Analyze the assigned articles',
+      ...(freshContext ? { fresh_context: true } : {}) });
   });
 
   it('rejects a refused Agent launch without retrying or replacing its diagnostics', async () => {

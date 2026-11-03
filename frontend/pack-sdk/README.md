@@ -1,6 +1,13 @@
 # OAW frontend Pack SDK
 
 Use `FrontendPlugin` and `PluginViewProps` from `@oaw/plugin-api`.
+
+The npm package version (1.1.0), the host Plugin API feature level (currently
+1.42), and the frontend loading protocol (`apiVersion: 1`) are independent.
+Declare the minimum Plugin API actually used in both your Python descriptor
+and source compatibility; a newer SDK package does not upgrade the host.
+See the [version guide](../../docs/reference/plugin-compatibility.md#which-version-to-declare).
+
 Build the default `FrontendPlugin` export with `buildPackFrontendVite` from
 `@oaw/plugin-api/build-vite`. The build replaces React, JSX, ReactDOM and runtime SDK
 imports with references to the host instances. Do not bundle another React,
@@ -77,7 +84,7 @@ these helpers. They use host theme tokens and shared React, and remain optional.
 See the [workspace design guide](../../docs/developers/workspace-design.md) for
 content templates, optional card/section sizing and one-shot layout recipes.
 
-`await host.runAgent(nodeId, prompt)` returns an `AgentRunReceipt` immediately
+`await host.runAgent(nodeId, prompt, freshContext?)` returns an `AgentRunReceipt` immediately
 after the host accepts the run: `{ accepted: true, agent_id, run_id }`.
 It does not wait for execution to finish or imply that business results were
 saved. The promise rejects on request failure; callers handle that error.
@@ -88,7 +95,10 @@ Execution-source reads still require their existing connection permissions;
 the receipt does not grant observation access or subscribe a plugin backend.
 
 This exposes the backend's existing admission response; it does not add a new
-launch endpoint or wait for a final result. Since Plugin API 1.42, plugin callers
+launch endpoint or wait for a final result. The existing optional `freshContext`
+argument is preserved: `true` uses a new context without earlier history;
+omitting it or passing `false` retains the Agent's shared default context.
+Since Plugin API 1.43, plugin callers
 must handle rejected launch promises themselves. The native Agent button keeps
 its existing error toast; the plugin path does not add that native-button toast.
 Calls that simply await and ignore a successful return can keep doing so.
@@ -102,3 +112,12 @@ positioning and keyboard dismissal. They preserve trigger layout, refs and event
 handlers. Use `Tooltip` for noninteractive hints and `Popover` for small interactive
 panels. Declare the matching adapter/manifest minimum; see the workspace design
 guide for examples and focus behavior.
+
+Plugin API 1.42 adds optional `host.credentials` for human configuration on
+Environment/Sandbox cards. `status()` returns configured flags; `set(reference,
+value, expectedRevision)` saves or removes a binding through existing backend
+checks. Secrets never belong in config, documents or `host.state`. The interface
+is absent in deployed Workspaces. See [credential configuration](../../docs/reference/plugin-frontend.md#human-credential-configuration).
+Content-owned surfaces can request `NodePresentation(content_controls="bottom", ...)`
+instead of the default side edge. The host reserves space and owns its controls;
+Pack CSS should style only Pack content. See [workspace design](../../docs/developers/workspace-design.md).

@@ -82,14 +82,14 @@ describe("authoritative world synchronization", () => {
     });
   });
 
-  it('returns the Run receipt on the plugin launch path without waiting for execution', async () => {
+  it.each([undefined, true])('returns the Run receipt on the plugin launch path with freshContext=%s', async freshContext => {
     const agent = card('agent', 'agent');
     useWorldStore.setState({ cards: [agent], activityOpen: false });
     const receipt = { accepted: true as const, agent_id: agent.id, run_id: 'run-1' };
     const start = vi.spyOn(worldApi, 'runAgent').mockResolvedValue(receipt);
-    expect(await useWorldStore.getState().requestAgentRun(agent.id, 'Analyze')).toEqual(receipt);
+    expect(await useWorldStore.getState().requestAgentRun(agent.id, 'Analyze', freshContext)).toEqual(receipt);
     expect(start).toHaveBeenCalledTimes(1);
-    expect(start).toHaveBeenCalledWith(agent.id, 'Analyze');
+    expect(start).toHaveBeenCalledWith(agent.id, 'Analyze', freshContext);
     expect(useWorldStore.getState().activityOpen).toBe(true);
     expect(useWorldStore.getState().toasts).toHaveLength(0);
   });
@@ -107,8 +107,9 @@ describe("authoritative world synchronization", () => {
   });
 
   it('retains the native Agent button error handling without an unhandled rejection', async () => {
-    vi.spyOn(worldApi, 'runAgent').mockRejectedValue(new Error('Agent is busy'));
-    await expect(useWorldStore.getState().runAgent('agent', 'Analyze')).resolves.toBeUndefined();
+    const start = vi.spyOn(worldApi, 'runAgent').mockRejectedValue(new Error('Agent is busy'));
+    await expect(useWorldStore.getState().runAgent('agent', 'Analyze', true)).resolves.toBeUndefined();
+    expect(start).toHaveBeenCalledWith('agent', 'Analyze', true);
     expect(useWorldStore.getState().toasts).toHaveLength(1);
     expect(useWorldStore.getState().toasts[0].title).toBe('Agent did not start');
   });

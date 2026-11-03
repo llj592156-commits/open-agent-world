@@ -809,10 +809,10 @@ export const worldApi = {
     return asRecord(body);
   },
 
-  runAgent(nodeId: string, prompt: string): Promise<AgentRunReceipt> {
+  runAgent(nodeId: string, prompt: string, freshContext = false): Promise<AgentRunReceipt> {
     return request<AgentRunReceipt>(`/agents/${encodeURIComponent(nodeId)}/run`, {
       method: "POST",
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, ...(freshContext ? { fresh_context: true } : {}) }),
     });
   },
 

@@ -213,7 +213,7 @@ recovery guarantees. Ordinary document `artifacts` metadata does not grant acces
 or retain file bytes.
 
 
-### Trusted Run identity (API 1.42)
+### Trusted Run identity (API 1.43)
 
 `NodeResourceContext.run_id` is an optional, host-supplied Run identity for the
 current Agent capability invocation. It is populated only when the active Run

@@ -404,8 +404,8 @@ interface WorldState {
   loadText: (id: string) => Promise<void>;
   saveText: (id: string, content: string, expectedRevision?: number) => Promise<boolean>;
   uploadImage: (id: string, file: File) => Promise<boolean>;
-  requestAgentRun: (id: string, prompt: string) => Promise<AgentRunReceipt>;
-  runAgent: (id: string, prompt: string) => Promise<void>;
+  requestAgentRun: (id: string, prompt: string, freshContext?: boolean) => Promise<AgentRunReceipt>;
+  runAgent: (id: string, prompt: string, freshContext?: boolean) => Promise<void>;
   stopAgent: (id: string) => Promise<void>;
   loadSandboxRuntimes: (refresh?: boolean) => Promise<void>;
   refreshSandbox: (id: string, clearError?: boolean) => Promise<void>;
@@ -1561,8 +1561,8 @@ export const useWorldStore = create<WorldState>()(persist((set, get) => ({
     }
   },
 
-  requestAgentRun: async (id, prompt) => {
-    const receipt = await worldApi.runAgent(id, prompt);
+  requestAgentRun: async (id, prompt, freshContext) => {
+    const receipt = await worldApi.runAgent(id, prompt, freshContext);
     set((state) => ({
       cards: state.cards.map((card) =>
         card.id === id
@@ -1574,9 +1574,9 @@ export const useWorldStore = create<WorldState>()(persist((set, get) => ({
     return receipt;
   },
 
-  runAgent: async (id, prompt) => {
+  runAgent: async (id, prompt, freshContext) => {
     try {
-      await get().requestAgentRun(id, prompt);
+      await get().requestAgentRun(id, prompt, freshContext);
     } catch (error) {
       get().pushToast({ tone: "error", title: "Agent did not start", detail: apiErrorMessage(error) });
     }

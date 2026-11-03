@@ -13,6 +13,7 @@ import * as registry from './registry';
 import { useConversationView } from '../state/conversationView';
 import { useNodeSurfaceStore } from '../state/nodeSurfaces';
 import type { PluginViewProps } from './sdk';
+import { WorkspaceAccess } from '../workspace/WorkspaceAccess';
 
 afterEach(() => { cleanup(); useLegionWorkspace.getState().close(); useNodeSurfaceStore.setState({ drafts: {} }); vi.restoreAllMocks(); });
 const card: WorldCard = { id: "extension-card", type: "example.agent", name: "Extension", status: "idle",
@@ -36,6 +37,43 @@ function install(pluginId: string, frontend: { settings?: string } = {}) {
   }] } });
   return updateCard;
 }
+
+it.each(['core.environment', 'core.sandbox'])('binds human credential configuration to a %s card without storing secrets in UI state', async trait => {
+  const update = install('test.credentials', { settings: 'view' });
+  const catalog = useWorldStore.getState().catalog;
+  useWorldStore.setState({ catalog: { ...catalog, node_types: catalog.node_types.map(item => ({ ...item, traits: [trait] })) } });
+  let props!: PluginViewProps;
+  vi.spyOn(registry, 'pluginView').mockReturnValue(((value: PluginViewProps) => { props = value; return <p>Credentials</p>; }) as ReturnType<typeof registry.pluginView>);
+  const status = vi.spyOn(worldApi, 'getCredentialBindings').mockResolvedValue({ token: false });
+  const bind = vi.spyOn(worldApi, 'bindCredential').mockResolvedValue({ configured: true });
+  render(<PluginSurface card={card} slot="settings" level="inspector" />);
+  await screen.findByText('Credentials');
+  const credentials = props.host.credentials!;
+  expect(await credentials.status()).toEqual({ token: false });
+  expect(status).toHaveBeenCalledWith(card.id);
+  await credentials.set('token', 'private-value', 7);
+  expect(bind).toHaveBeenCalledWith(card.id, 'token', 'private-value', 7);
+  await credentials.set('token', null, 7);
+  expect(bind).toHaveBeenLastCalledWith(card.id, 'token', null, 7);
+  const conflict = new Error('Environment changed; reload before saving');
+  bind.mockRejectedValueOnce(conflict);
+  await expect(credentials.set('token', 'replacement', 6)).rejects.toBe(conflict);
+  expect(update).not.toHaveBeenCalled();
+  expect(props.host.draft!.get()).toBeUndefined();
+});
+
+it.each([false, true])('omits credential configuration for an ordinary card or deployed workspace (deployed=%s)', async deployed => {
+  install('test.credentials', { settings: 'view' });
+  if (deployed) {
+    const catalog = useWorldStore.getState().catalog;
+    useWorldStore.setState({ catalog: { ...catalog, node_types: catalog.node_types.map(item => ({ ...item, traits: ['core.environment'] })) } });
+  }
+  let props!: PluginViewProps;
+  vi.spyOn(registry, 'pluginView').mockReturnValue(((value: PluginViewProps) => { props = value; return <p>Viewer</p>; }) as ReturnType<typeof registry.pluginView>);
+  render(<WorkspaceAccess.Provider value={{ deployed, permissions: {} }}><PluginSurface card={card} slot="settings" level="inspector" /></WorkspaceAccess.Provider>);
+  await screen.findByText('Viewer');
+  expect(props.host.credentials).toBeUndefined();
+});
 
 it("loads the actual local plugin entry and saves through the scoped host SDK", async () => {
   const update = install("openai.codex", { settings: "settings" });
@@ -168,7 +206,9 @@ it('binds the SDK to the originating session while exposing no session argument 
 });
 
 
-it.each(['accepted', 'rejected'] as const)('preserves %s Agent admission through the actual plugin host bridge', async outcome => {
+it.each([
+  ['accepted', undefined], ['accepted', true], ['rejected', undefined], ['rejected', true],
+] as const)('preserves %s Agent admission through the actual plugin host bridge with freshContext=%s', async (outcome, freshContext) => {
   install('test.launcher', { settings: 'view' });
   const agent: WorldCard = { ...card, id: 'executor', type: 'agent' };
   useWorldStore.setState({ cards: [card, agent], toasts: [], activityOpen: false });
@@ -185,11 +225,11 @@ it.each(['accepted', 'rejected'] as const)('preserves %s Agent admission through
   render(<PluginSurface card={card} slot="settings" level="inspector" />);
   await screen.findByText('Launch fixture');
   await act(async () => {
-    const result = props.host.runAgent(agent.id, 'Inspect the assigned work');
+    const result = props.host.runAgent(agent.id, 'Inspect the assigned work', freshContext);
     if (outcome === 'accepted') await expect(result).resolves.toBe(receipt);
     else await expect(result).rejects.toBe(failure);
   });
   expect(request).toHaveBeenCalledTimes(1);
-  expect(request).toHaveBeenCalledWith(agent.id, 'Inspect the assigned work');
+  expect(request).toHaveBeenCalledWith(agent.id, 'Inspect the assigned work', freshContext);
   expect(useWorldStore.getState().toasts).toHaveLength(0);
 });

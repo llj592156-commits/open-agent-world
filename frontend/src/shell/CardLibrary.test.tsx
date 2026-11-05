@@ -37,16 +37,27 @@ it('keeps the IDE in collapsed developer tools and returns to the Library after 
 const installedContentPack = { id: 'local.research', name: 'Research kit', version: '1.0.0', selected: true, loaded: false,
   kind: 'content' as const, environment: null };
 
-it('keeps hosted collections available without exposing plugin installation or store controls', async () => {
+it('lets hosted users browse Store while keeping installation controls unavailable', async () => {
   vi.spyOn(hostedAuth, 'isHosted').mockReturnValue(true);
-  useCardLibrary.setState({ snapshot: snapshot(), open: true, tab: 'store', refresh: async () => {} });
+  useCardLibrary.setState({ snapshot: snapshot(), open: true, tab: 'packs', refresh: async () => {} });
   useWorldStore.setState({ legions: [] });
   await act(async () => { render(<CardLibrary />); });
-  expect(screen.queryByRole('button', { name: 'Store' })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Store' })).toBeTruthy();
   expect(screen.queryByRole('button', { name: 'Install Pack from File...' })).toBeNull();
   expect(screen.queryByLabelText('Pack file')).toBeNull();
   expect(worldApi.getInstalledPacks).not.toHaveBeenCalled();
   expect(screen.getByRole('heading', { name: 'Pack inventory' })).toBeTruthy();
+});
+
+it('enables the existing installer for an operator-enabled hosted administrator', async () => {
+  vi.spyOn(hostedAuth,'isHosted').mockReturnValue(true);
+  vi.spyOn(hostedAuth,'canManageHostedPacks').mockReturnValue(true);
+  useCardLibrary.setState({snapshot:snapshot(),open:true,tab:'packs',refresh:async()=>{}});
+  useWorldStore.setState({legions:[]});
+  await act(async()=>{render(<CardLibrary/>);});
+  expect(screen.getByRole('button',{name:'Install Pack from File...'})).toBeTruthy();
+  expect(worldApi.getInstalledPacks).toHaveBeenCalled();
+  expect(screen.queryByText('Developer tools')).toBeNull();
 });
 
 it('adds an installed file to the inventory immediately and closes its installation panel', async () => {
@@ -64,11 +75,30 @@ it('adds an installed file to the inventory immediately and closes its installat
   expect(within(pack).getByText('Restart required')).toBeTruthy();
   expect(container.querySelector('.pack-install-popover')).toBeNull();
   expect(container.querySelector('.pack-installer')).toBeNull();
+  expect(screen.getByRole('dialog', { name: 'Restart OAW now?' })).toBeTruthy();
+  const restart = vi.spyOn(worldApi, 'restartApplication');
+  fireEvent.click(screen.getByRole('button', { name: 'Restart later' }));
+  expect(screen.queryByRole('dialog', { name: 'Restart OAW now?' })).toBeNull();
+  expect(restart).not.toHaveBeenCalled();
   expect(screen.getByRole('button', { name: 'Install Pack from File...' }).hasAttribute('disabled')).toBe(false);
   expect(screen.queryByRole('button', { name: 'Uninstall Pack' })).toBeNull();
   fireEvent.click(within(pack).getByRole('button', { name: /^(Tear open|View pack)/ }));
   expect(screen.getByRole('button', { name: 'Uninstall Pack' })).toBeTruthy();
   expect(screen.queryByRole('button', { name: 'Open pack' })).toBeNull();
+});
+
+it('does not ask to restart after a Pack becomes available immediately', async () => {
+  useCardLibrary.setState({ snapshot: snapshot(), open: true, tab: 'packs', refresh: async () => {} });
+  useWorldStore.setState({ legions: [] });
+  vi.spyOn(worldApi, 'inspectPack').mockResolvedValue({ manifest: installedContentPack, sha256: 'digest' });
+  vi.spyOn(worldApi, 'installPack').mockResolvedValue({ restart_required: false, versions: [{ ...installedContentPack, loaded: true }] });
+  render(<CardLibrary />);
+  const file = new File(['zip'], 'research.oawpack');
+  vi.spyOn(file, 'slice').mockReturnValue({ arrayBuffer: async () => new Uint8Array([0x50, 0x4b, 3, 4]).buffer } as Blob);
+  await act(async () => fireEvent.change(screen.getByLabelText('Pack file'), { target: { files: [file] } }));
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Install Pack' })));
+  expect(screen.getByRole('article', { name: 'Research kit' })).toBeTruthy();
+  expect(screen.queryByRole('dialog', { name: 'Restart OAW now?' })).toBeNull();
 });
 
 it('opens installed packs and browses their cards before entering secondary management', async () => {
@@ -154,18 +184,22 @@ it('shows a local installation plan and prevents installing with unresolved bloc
   expect(install).not.toHaveBeenCalled();
 });
 
-it('shows uninstall resource ownership and blocks removal until dependencies permit it', async () => {
+it.each([
+  ['Another Pack requires this renderer', 'Another Pack requires this renderer'],
+  ['In use by card Harness', 'Remove the card "Harness" before uninstalling this Pack.'],
+])('explains an uninstall blocker next to confirmation: %s', async (blocker, explanation) => {
   const state = packSnapshot();
   const id = state.packs.alpha.definition.plugin_id;
   vi.mocked(worldApi.getInstalledPacks).mockResolvedValue({ restart_required: false, versions: [{ ...installedContentPack, id, loaded: true }] });
-  vi.mocked(worldApi.getPackUninstallPlan).mockResolvedValue({ id, owner: id, can_uninstall: false, blockers: ['Another Pack requires this renderer'],
+  vi.mocked(worldApi.getPackUninstallPlan).mockResolvedValue({ id, owner: id, can_uninstall: false, blockers: [blocker],
     source: 'installed', restart_required: true, resources: [{ id: 'shared-science', kind: 'python', action: 'retain', reason: 'Used by XRD' }] });
   const remove = vi.spyOn(worldApi, 'managePack');
   useCardLibrary.setState({ snapshot: state, open: true, tab: 'packs', refresh: async () => {} });
   await act(async () => { render(<CardLibrary />); });
   fireEvent.click(screen.getByRole('button', { name: 'View pack Alpha pack' }));
   await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Uninstall Pack' })));
-  expect(screen.getByRole('alert').textContent).toContain('Another Pack requires this renderer');
+  expect(screen.getByRole('alert').textContent).toContain(explanation);
+  expect(screen.getByRole('button', { name: 'Confirm uninstall' }).getAttribute('aria-describedby')).toBe('pack-uninstall-blockers');
   expect(screen.getByText('Used by XRD')).toBeTruthy();
   expect((screen.getByRole('button', { name: 'Confirm uninstall' }) as HTMLButtonElement).disabled).toBe(true);
   expect(remove).not.toHaveBeenCalled();
@@ -283,6 +317,46 @@ it('scopes failures to their owner and repairs source environments from secondar
   expect((screen.getByLabelText('Source pack') as HTMLSelectElement).value).toBe('pack:alpha');
 });
 
+it('retries a selected archive environment when the same owner also has source inventory', async () => {
+  const state = packSnapshot();
+  const owner = state.packs.alpha.definition.plugin_id;
+  const version = { ...installedContentPack, id: 'distribution.alpha', owner, kind: 'plugin' as const,
+    environment: { state: 'environment_failed', error: 'Source ownership conflict' } };
+  const source = { id: version.id, owner, name: 'Alpha pack', version: version.version,
+    source: 'development' as const, enabled: true, loaded: true,
+    environments: [], backend_requirements: [], frontend_dependencies: [], warnings: [] };
+  const installed = { restart_required: true, versions: [version], inventory: [source] };
+  vi.mocked(worldApi.getInstalledPacks).mockResolvedValue(installed);
+  const retry = vi.spyOn(worldApi, 'managePack').mockResolvedValue(installed);
+  useCardLibrary.setState({ snapshot: state, open: true, tab: 'packs', refresh: async () => {} });
+  await act(async () => { render(<CardLibrary />); });
+  fireEvent.click(screen.getByRole('button', { name: 'View pack Alpha pack' }));
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Retry environment preparation' })));
+  expect(retry).toHaveBeenCalledWith('environment/retry', 'POST', undefined);
+});
+
+it.each(['failed', 'missing'] as const)('targets the declared executable runtime when it is %s', async environmentState => {
+  const state = packSnapshot();
+  const owner = state.packs.alpha.definition.plugin_id;
+  const version = { ...installedContentPack, id: 'distribution.alpha', owner, kind: 'plugin' as const,
+    environment: { state: 'environment_ready', error: null } };
+  const runtime = { id: version.id, owner, name: 'Alpha pack', version: version.version,
+    source: 'installed' as const, enabled: true, loaded: true, backend_requirements: [], frontend_dependencies: [], warnings: [],
+    environments: [{ id: 'native', target: 'host-worker' as const, provider: 'executable' as const, management: 'managed' as const,
+      state: environmentState, python: [], node: [], error: environmentState === 'failed' ? 'Executable preparation was interrupted' : null }] };
+  const installed = { restart_required: false, versions: [version], inventory: [runtime] };
+  vi.mocked(worldApi.getInstalledPacks).mockResolvedValue(installed);
+  const retry = vi.spyOn(worldApi, 'managePack').mockResolvedValue({ ...installed, inventory: [{ ...runtime,
+    environments: [{ ...runtime.environments[0], state: 'ready', error: null }] }] });
+  useCardLibrary.setState({ snapshot: state, open: true, tab: 'packs', refresh: async () => {} });
+  await act(async () => { render(<CardLibrary />); });
+  fireEvent.click(screen.getByRole('button', { name: 'View pack Alpha pack' }));
+  const action = screen.getByRole('button', { name: environmentState === 'failed' ? 'Retry native runtime' : 'Prepare native runtime' });
+  if (environmentState === 'failed') expect(within(action.parentElement!).getByRole('alert').textContent).toBe('native: Executable preparation was interrupted');
+  await act(async () => fireEvent.click(action));
+  expect(retry).toHaveBeenCalledWith('environment/retry', 'POST', { pack_id: version.id, environment_id: 'native' });
+});
+
 afterEach(() => {
   cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals();
   useCardLibrary.setState({ snapshot: null, busy: false, open: false, tab: "packs", inspectedEntry: null, error: "", refresh: originalRefresh });
@@ -314,20 +388,42 @@ it("keeps the collected finish across library, detail and deck rerenders with no
   expect(screen.getByText("Rainbow", { selector: ".library-finish-metadata" })).toBeTruthy();
 });
 
-it("shows preset artwork in the grouped collection detail stage", () => {
+it("shares preset covers, failed-cover fallback and replacement artwork across collection, detail and deck", () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: true, addEventListener() {}, removeEventListener() {} }));
   const state = packSnapshot();
   const artwork = '/api/plugins/xrd/assets/workbench-cover.svg';
   state.packs.alpha.definition.artwork_url = artwork;
   state.preset_pack_ids = { workbench: ['alpha'] };
+  state.decks[0].entries = [{ kind: 'legion', id: 'workbench' }];
   openCards(state);
   act(() => useWorldStore.setState({ legions: [{ id: 'workbench', name: 'XRD workbench', preset: true,
     node_count: 2, edge_count: 1, bounds: { width: 600, height: 400 }, node_types: ['card.1'],
     plugin_ids: [TEST_CATALOG.plugins[0].id], compatible: true, issues: [], revision: 1 }] }));
   fireEvent.change(screen.getByLabelText('Source pack'), { target: { value: 'pack:alpha' } });
   fireEvent.click(screen.getByRole('button', { name: 'Inspect XRD workbench' }));
+  render(<ComponentPalette />);
   const cover = within(screen.getByRole('complementary', { name: 'Card details' })).getByRole('img', { name: 'XRD workbench' });
   expect(cover.getAttribute('src')).toBe(artwork);
   expect(cover.closest('.library-detail-stage')).not.toBeNull();
+  const covers = screen.getAllByRole('img', { name: 'XRD workbench' });
+  expect(covers).toHaveLength(3);
+  for (const image of covers) {
+    expect(image.getAttribute('src')).toBe(artwork);
+    expect(image.parentElement?.querySelector('.card-face')).toBeNull();
+    fireEvent.error(image);
+  }
+  const faces = document.querySelectorAll('[data-library-card="workbench"] .card-face, .library-card-preview .card-face, [data-palette-card="workbench"] .card-face');
+  expect(faces).toHaveLength(3);
+  for (const face of faces) {
+    expect(face.querySelector('.lucide-layers')).toBeTruthy();
+    expect(face.innerHTML).toBe(faces[0].innerHTML);
+  }
+  const replacement = structuredClone(state);
+  replacement.packs.alpha.definition.artwork_url = '/replacement-cover.svg';
+  act(() => useCardLibrary.setState({ snapshot: replacement }));
+  const replaced = screen.getAllByRole('img', { name: 'XRD workbench' });
+  expect(replaced).toHaveLength(3);
+  for (const image of replaced) expect(image.getAttribute('src')).toBe('/replacement-cover.svg');
 });
 
 it("keeps complete source groups together, including packs larger than the former page limit", () => {
@@ -339,11 +435,13 @@ it("keeps complete source groups together, including packs larger than the forme
   }
   openCards(state);
   for (const [name, count] of [["Alpha pack", 28], ["Beta pack", 47]] as const) {
-    const group = screen.getByRole("heading", { name }).closest("details")!;
-    expect(group.open).toBe(false);
-    group.open = true;
-    expect(within(group).getByText(`${count} cards`)).toBeTruthy();
+    const group = screen.getByRole("group", { name });
     expect(within(group).getAllByRole("button", { name: /^Inspect Tool/ })).toHaveLength(count);
+    fireEvent.click(within(group).getByRole('button', { name: `Collapse ${name}` }));
+    expect(within(group).queryByRole('button', { name: /^Inspect Tool/ })).toBeNull();
+    expect(within(group).getByText(String(count), { selector: '.library-group-count' })).toBeTruthy();
+    fireEvent.click(within(group).getByRole('button', { name: `Expand ${name}` }));
+    expect(within(group).getAllByRole('button', { name: /^Inspect Tool/ })).toHaveLength(count);
   }
   expect(screen.queryByLabelText("Next cards")).toBeNull();
   fireEvent.change(screen.getByLabelText("Source pack"), { target: { value: "pack:beta" } });
@@ -410,12 +508,8 @@ it("groups by collected pack provenance, deduplicates shared cards and filters b
   openCards(state);
   expect(screen.getByRole("heading", { name: "Alpha pack" })).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Beta pack" })).toBeTruthy();
-  expect(screen.getByRole("heading", { name: "Alpha pack" }).closest("details")?.hasAttribute("open")).toBe(false);
-  for (const name of ["Alpha pack", "Beta pack"]) {
-    const summary = screen.getByRole("heading", { name }).closest("summary")!;
-    expect(summary.querySelector("small")).toBeNull();
-    fireEvent.click(summary);
-  }
+  expect(screen.queryByRole('button', { name: 'Collapse Alpha pack' })).toBeNull();
+  expect(screen.queryByRole('button', { name: 'Collapse Beta pack' })).toBeNull();
   expect(screen.getAllByRole("button", { name: "Inspect Review toolbox" })).toHaveLength(1);
   expect(screen.getAllByRole("button", { name: /^Inspect / })).toHaveLength(2);
   fireEvent.change(screen.getByLabelText("Source pack"), { target: { value: "pack:beta" } });
@@ -426,6 +520,18 @@ it("groups by collected pack provenance, deduplicates shared cards and filters b
   fireEvent.change(screen.getByLabelText("Card category"), { target: { value: "Even" } });
   expect(screen.getByText("No matching cards")).toBeTruthy();
   expect(screen.getByText(/1 matching internal cards are hidden/)).toBeTruthy();
+});
+
+it('keeps single-card groups open and exposes matches inside a previously folded group', () => {
+  const state = packSnapshot();
+  state.card_definitions['card.2'].user_creatable = true;
+  openCards(state);
+  expect(screen.queryByRole('button', { name: 'Collapse Beta pack' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Collapse Alpha pack' }));
+  expect(screen.queryByRole('button', { name: 'Inspect Review toolbox · Skill' })).toBeNull();
+  fireEvent.change(screen.getByLabelText('Search cards'), { target: { value: 'Review toolbox · Skill' } });
+  expect(screen.getByRole('button', { name: 'Inspect Review toolbox · Skill' })).toBeTruthy();
+  expect(screen.queryByRole('button', { name: /^(Expand|Collapse) Alpha pack$/ })).toBeNull();
 });
 
 it("identifies internal cards by their exact container, retains descriptions and leads to the usable card", () => {

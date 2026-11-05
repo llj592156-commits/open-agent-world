@@ -72,6 +72,7 @@ export interface PackInstallations {
   versions: Array<{ id: string; name: string; version: string; selected: boolean; loaded: boolean;
     owner?: string; source?: string;
     kind?: 'plugin' | 'content'; creator?: CreatorMetadata | null;
+    presentation?: Omit<import('./world').PackDefinition, 'plugin_id' | 'source' | 'artwork_url'> | null;
     environment: { state: string; error: string | null } | null }>;
 }
 
@@ -87,6 +88,9 @@ export interface StorePreview {
   packaging: import('./world').PackPackaging;
   accent_color?: string | null;
   count?: number | null;
+  icon?: string | null;
+  icon_url?: string | null;
+  artwork_url?: string | null;
 }
 export interface StorePack extends StoreState {
   preview?: StorePreview | null;

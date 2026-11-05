@@ -10,6 +10,12 @@ instance per account. It has no public registration, shared workspaces across us
 autoscaling or automatic release upgrades. Administrators manage accounts through
 the server CLI; there is no browser administration API.
 
+Password sign-ins persist for 24 hours in a server-backed HttpOnly cookie, including
+across browser and gateway restarts. OIDC sessions remain bounded by the identity
+provider's expiry. Temporary network failures keep the workspace open and retry
+automatically; confirmed expiry, revocation or account changes require signing in
+again. Returning to a regular browser tab verifies the account in the background.
+
 ## Prepare the installation
 
 Use Linux with running systemd 249+, Python 3.11+ and the Node/uv tools required by
@@ -67,6 +73,12 @@ confirmation. Never put passwords in commands, URLs or source files. Use
 receives a stable internal UUID.
 
 ### Open a published Workspace after login
+
+A release can include several Legion workspaces. Select them and set their order
+in **Publish application**; the first workspace opens after login. The title menu
+only lists published workspaces. Template export and per-user provisioning preserve
+this order and remap each workspace's layout to the new user's cards.
+The existing template size limit of 101 nodes applies to the combined selection.
 
 Publish a Legion in an engineering workspace, stop that backend, then export a template:
 
@@ -242,6 +254,91 @@ the server stores its hash.
 
 ## Administration and backups
 
+### Automatic workspace provisioning
+
+The provider-neutral hosting queue is available to enabled administrators through
+`/hosting/admin/deployments`. Promote an existing account with `scripts/hosted.py
+user-role --directory /srv/oaw-hosting --user OPERATOR --role admin`. Role changes
+revoke the account's existing sessions. Create its engineering workspace and enable
+the native queue reconciler on the installed Linux host:
+
+```bash
+sudo backend/.venv/bin/python -m backend.hosting.provisioner engineering \
+  --directory /srv/oaw-hosting --application /opt/open-agent-world --user OPERATOR
+sudo backend/.venv/bin/python -m backend.hosting.provisioner enable \
+  --directory /srv/oaw-hosting --application /opt/open-agent-world
+```
+
+Publish an engineering workspace before submitting a deployment intent. The queue
+freezes its validated portable definition, uses an idempotent request UUID, and
+initializes each new workspace as its own restricted service user. It publishes the
+route after initialization succeeds. Existing profiles, user entry choices and
+their files remain in place. Gateway routing reloads registered profiles without
+restarting existing workers. Entry assignment requires the target profile's owner.
+
+For cloud resources, install a **root-owned**, non-writable-by-others
+`/srv/oaw-hosting/resource-provisioner.json`, outside the gateway-owned `control`
+directory:
+
+```json
+{
+  "handler": "your_operator_adapter.provisioning:prepare_profile",
+  "settings": {}
+}
+```
+
+The installed operator callable receives `(profile, settings, hosting_directory)`.
+It returns `None` while resources are pending, or a mapping of JSON basenames to
+assignment objects when ready. Returning `None` retains the job/profile identity
+and reports `waiting_resources`; no instance directory, service account or worker
+unit exists yet. Assignment files are installed root-owned with the new worker's
+group and mode `0640` before bootstrap. Reserved names, paths and symlinked or
+untrusted configuration are rejected. Provider management credentials belong in
+this operator boundary and never in browser deployment requests or user data.
+Without this configuration, provisioning uses the existing native behavior.
+
+A failed or interrupted local installation requires operator inspection. The
+reconciler retries resource readiness but never repeats an uncertain local install.
+
+### Preserve profiles across releases
+
+Keep code/dependencies outside `/srv/oaw-hosting`, and retain every profile's
+`worker.json`, UUID, owner binding and `data` directory across application code
+releases. Never rerun template initialization over an existing profile. The
+offline helper `python -m backend.hosting.upgrades --config /path/to/worker.json`
+runs ordinary Pack startup migrations and refreshes installed contracts on already
+published surfaces. Run it inside that profile's existing service identity and
+filesystem restrictions after stopping ingress and saving a recoverable backup.
+It refuses a running profile, unfinished runs, a changed owner or an incompatible
+published scope, and preserves saved layouts, release identity, user history and
+files. The release operator remains responsible for backup and rollback if a Pack
+migration fails.
+
+Published application definitions can be updated in the same runtime profile only
+when exported source identity and node lineage match. New exports record this
+lineage; older profiles require an explicit migration rather than name matching.
+Compatible updates retain documents, private state, files and credentials. Changes
+to graph ownership, card types or resource payloads require a migration plan.
+An update uses the same deployment endpoint with an explicit map covering every
+target user:
+
+```json
+{
+  "request_id": "REQUEST_UUID",
+  "release_id": "PUBLISHED_RELEASE_UUID",
+  "user_ids": ["USER_UUID"],
+  "mode": "runtime",
+  "target_profiles": {"USER_UUID": "EXISTING_RUNTIME_PROFILE_UUID"}
+}
+```
+
+Omitting `target_profiles` requests a new workspace. An incompatible update fails
+without falling back to creating another profile. Updates keep the worker's owner,
+application ID, secret, resource assignment and entry selection. The restricted
+update task refuses unfinished runs and applies compatible metadata changes with a
+durable database-to-manifest handoff. Overlapping edits to the same configuration
+field require explicit resolution; user documents and files are never reimported.
+
 Application code and Pack dependencies are administrator-managed. Installation
 and updates perform full verification. Ordinary startup checks receipts, version
 compatibility and top-level loading paths without rescanning every dependency
@@ -272,6 +369,32 @@ matching code/dependency versions and systemd configuration. Keep account data,
 signing keys, user files and encrypted credentials together. Never expose the
 control directory as a static site or commit it. `.oaw-hosting/` is ignored;
 other deployment directories should be outside the repository.
+
+## Administrator Pack installation
+
+An administrator can use the normal Store and file installer when the operator
+enables `pack_management: true` on both its **builder** profile in `hosting.json`
+and its private `worker.json`. Existing profiles default to disabled. The gateway
+checks the current account role and instance on every management request, strips
+client-supplied authority, and signs a short-lived method/path-bound grant for
+that exact worker. Ordinary users retain read-only Store browsing. IDE, host
+filesystem configuration and unrelated deployment APIs remain restricted.
+
+Acquisition verifies the archive and retains its original bytes under
+`control/pack-archives`. Dependency preparation and plugin loading run under the
+private worker UID. Python Packs use the existing restart prompt; the worker
+shuts down gracefully and exits with code 75 so systemd restarts that worker.
+The gateway and other users' workers remain running.
+
+Publish after the new version has loaded. The template pins distribution IDs,
+versions and archive hashes. The reconciler copies only these bounded archives
+as data into a new instance's read-only `pack-inputs`; its existing nonroot
+initialization task prepares them with the normal Pack installer. User data is
+never copied from the administrator profile. Runtime workers load exactly their
+approved selection and cannot install code through their public API. Changing
+Pack versions requires a new workspace deployment; compatible template updates
+keep their existing Pack pins. Review the sealed provisioner update before
+enabling this workflow on an existing server.
 
 ## Local integration debugging
 

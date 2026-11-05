@@ -9,6 +9,7 @@ from pydantic import BaseModel, ValidationError
 from backend.agents import ScopedToolDefinition, ToolParameter
 from backend.errors import ResourceValidationError, RuntimeUnavailableError
 from backend.resources.models import TextReplace
+from backend.sandbox.task_workspace import task_path, binding as task_binding, ensure_directory
 
 if TYPE_CHECKING:
     from backend.services import ApplicationServices
@@ -18,7 +19,10 @@ def _python_environment_summary(status):
     if not isinstance(status, dict):
         return None
     packages = status.get("package_versions") or {}
-    return {"ready": status.get("ready"), "preparing": status.get("preparing", False),
+    dependencies = status.get("dependencies") or {}
+    return {"ready": bool(status.get("ready") and dependencies.get("ready", True) and not status.get("warmup_error")),
+        "interpreter_ready": status.get("ready"), "dependencies": dependencies,
+        "preparing": status.get("preparing", False) or dependencies.get("state") == "preparing",
         "python_version": status.get("python_version"),
         "package_versions": {name: packages[name] for name in ("numpy", "ase", "scipy", "pymatgen", "matplotlib")
                              if name in packages},
@@ -160,6 +164,10 @@ class _CapabilityContext:
         from backend.plugins.summoning import SummoningAction
         return await self.services.summoning.action(capability.target_id, _validate_tool_request(SummoningAction, arguments), capability=capability)
 
+    async def run_history_action(self, capability, action, arguments):
+        from backend.runs.tools import invoke
+        return await invoke(self.services, capability, action, arguments)
+
     async def node_execution_action(self, capability, action, arguments):
         from backend.node_execution import ExecutionRequest
         service = self.services.node_execution
@@ -202,9 +210,10 @@ class _CapabilityContext:
                 self.services.capabilities.capability_for_id(capability.agent_id, f"{kind}:{live.target_id}")
             self.services.capabilities.require_sandbox_execute(capability.agent_id, sandbox_id)
             self.services._require_card_type(sandbox_id, "sandbox")
+            await ensure_directory(self.services, sandbox_id, capability.agent_id)
             return await self.services._require_sandbox_backend().file_operation(
-                sandbox_id, "write", root="workspace", path=path,
-                data=base64.b64encode(data).decode("ascii"), overwrite=False,
+                sandbox_id, "write", root="workspace", path=task_path(self.services, sandbox_id, path, capability.agent_id),
+                data=base64.b64encode(data).decode("ascii"), overwrite=False, create_parents=True,
             )
 
     async def write_sandbox_text_file(self, capability, path: str, content: str | None = None,
@@ -233,13 +242,14 @@ class _CapabilityContext:
                 raise PermissionDeniedError("Sandbox file-write capability was revoked")
             self.services.capabilities.require_sandbox_execute(capability.agent_id, live.target_id)
             self.services._require_card_type(live.target_id, "sandbox")
+            await ensure_directory(self.services, live.target_id, capability.agent_id)
             if edits is not None:
                 result = await self.services._require_sandbox_backend().file_operation(
-                    live.target_id, "edit", root="workspace", path=path,
+                    live.target_id, "edit", root="workspace", path=task_path(self.services, live.target_id, path, capability.agent_id),
                     edits=edits)
             else:
                 result = await self.services._require_sandbox_backend().file_operation(
-                    live.target_id, "write", root="workspace", path=path,
+                    live.target_id, "write", root="workspace", path=task_path(self.services, live.target_id, path, capability.agent_id),
                     data=base64.b64encode(raw).decode("ascii"), overwrite=overwrite, create_parents=True)
         return {"path": path, **result}
 
@@ -257,7 +267,7 @@ class _CapabilityContext:
             self.services.capabilities.require_sandbox_execute(capability.agent_id, sandbox_id)
             self.services._require_card_type(sandbox_id, "sandbox")
             result = await self.services._require_sandbox_backend().file_operation(
-                sandbox_id, "download", root="workspace", path=path,
+                sandbox_id, "download", root="workspace", path=task_path(self.services, sandbox_id, path, capability.agent_id),
             )
         if result.get("state") != "ready":
             raise ResourceValidationError("Sandbox file is unavailable or exceeds the 16 MiB transfer limit")
@@ -425,6 +435,10 @@ class _CapabilityContext:
         info = await self.services.stop_sandbox(sandbox_id, agent_id=agent_id)
         return {"sandbox_id": sandbox_id, "state": info.state.value}
 
+    async def sandbox_workspace_action(self, capability, operation, options):
+        from backend.sandbox_workspace import inspect_workspace
+        return await inspect_workspace(self.services, capability, operation, options)
+
     async def inspect_sandbox(self, agent_id: str, sandbox_id: str, *, history_scope="caller", history_limit=3,
                               include_output=False, include_shared_python=False) -> dict[str, Any]:
         self.services.capabilities.require_sandbox_execute(agent_id, sandbox_id)
@@ -441,6 +455,8 @@ class _CapabilityContext:
         # and ``configuration.ready`` only reports configured variables. Make
         # the command gate explicit so an errored sandbox is not mistaken for
         # a usable one.
+        workspace_binding = task_binding(self.services, sandbox_id, agent_id)
+        task_directory = workspace_binding["directory"]
         commands_accepted = info.state.value in {"ready", "running"}
         state_guidance = None
         if info.state.value == "error":
@@ -458,7 +474,12 @@ class _CapabilityContext:
             "sandbox_id": sandbox_id, "state": info.state.value,
             "commands_accepted": commands_accepted, "state_guidance": state_guidance,
             "runtime_id": info.runtime_id, "platform": info.platform,
-            "shell": list(info.shell), "workspace": str(info.workspace),
+            "shell": list(info.shell), "workspace": str(info.workspace / task_directory) if task_directory else str(info.workspace),
+            "sandbox_workspace": str(info.workspace),
+            "task_workspace": {key: value for key, value in workspace_binding.items() if key != "shared_inputs"},
+            "shared_input_count": len(workspace_binding.get("shared_inputs", [])),
+            "shared_workspace": str(info.workspace / "shared"),
+            "file_paths": "Relative command/Skill/file-tool paths use workspace. Use scope=all for read-only access to other workspace files, or scope=shared for explicit shared/ inputs.",
             "workspace_access": info.workspace_access.value,
             "resources_path": str(info.resources_path) if info.resources_path else None,
             "available": info.available, "unavailable_reason": info.unavailable_reason,
@@ -478,7 +499,7 @@ class _CapabilityContext:
             "history_scope": history_scope,
             "shared_python": python_status if include_shared_python else None,
             "python_environment": _python_environment_summary(python_status),
-            "console_mode": "non-interactive; each command starts in the configured workspace; cd/export/activation do not persist",
+            "console_mode": "non-interactive; every command and relative file tool uses this assigned workspace; cd/export/activation do not persist",
             "command_timeout": self.services.world.get_card(sandbox_id).config.get("command_timeout", 6000),
             "installation": "Use install_python_packages for the shared read-only Python environment. HOME persists (at /sandbox/home on Linux, WSL and macOS Container VM); use $HOME/.local/bin or $HOME/bin for local CLI tools, or create a private venv in HOME/workspace and invoke its interpreter explicitly. npm -g defaults to $HOME/.local, with bins on PATH. /tmp is recreated for EVERY command; use HOME or workspace for files needed by subsequent commands. Shared installer logs are optional (include_shared_python=true) and do not prove a current operation is running.",
             "attachments": [
@@ -513,6 +534,27 @@ class WorldAgentCapabilityProvider:
 
     def managed_environment_root(self):
         return self.services.settings.data_root
+
+    def subprocess_environment(self):
+        from backend.agents.environment import subprocess_environment
+        return subprocess_environment(inherit=self.services.settings.inherit_runtime_environment)
+
+    def runtime_execution(self, agent_id, run_id, *, workspace, home):
+        from contextlib import asynccontextmanager
+        from backend.runs.models import TERMINAL_RUN_STATUSES
+        @asynccontextmanager
+        async def open_execution():
+            manager = self.services._require_run_manager()
+            context = manager.current_context
+            if (context is None or (context.agent_id, context.run_id) != (agent_id, run_id)
+                    or manager.get_run(run_id).status in TERMINAL_RUN_STATUSES):
+                raise ResourceValidationError("Runtime execution requires the current active agent run")
+            async with self.services.open_runtime_execution(agent_id, run_id, workspace=workspace, home=home) as execution:
+                yield execution
+        return open_execution()
+
+    def runtime_execution_configuration(self, agent_id):
+        return self.services.runtime_execution_configuration(agent_id)
 
     def __init__(self, services: ApplicationServices) -> None:
         self.services = services
@@ -561,6 +603,110 @@ class WorldAgentCapabilityProvider:
                 conversation_max_sequence=max(self.services.conversations.get_message(mid).sequence for mid in claimed))
             # Refresh delivery badges without manufacturing another chat message.
             await self.services._publish_conversation_message(self.services.conversations.get_message(claimed[-1]))
+
+    def _conversation_file_scope(self, agent_id, run_id):
+        scope = self._conversation_input_scope(agent_id, run_id)
+        if scope is None:
+            return None
+        manager = self.services._require_run_manager()
+        run = manager.get_run(run_id)
+        context = manager.current_context
+        if run.agent_id != agent_id or context.context_id != scope[1] or run.context_id != scope[1]:
+            raise ResourceValidationError('Conversation files require this Run\'s current session')
+        # Delegated runtimes inherit the admitting conversation Run's history
+        # boundary; they must not see follow-ups that have not been accepted.
+        boundary = run
+        while boundary.caller_kind != 'conversation':
+            boundary = manager.get_run(boundary.parent_run_id)
+        return (*scope, boundary.lifecycle.get('conversation_max_sequence'))
+
+    def _conversation_attachment_entries(self, agent_id, run_id):
+        from backend.errors import NotFoundError, PermissionDeniedError
+        scope = self._conversation_file_scope(agent_id, run_id)
+        if scope is None:
+            return []
+        conversation_id, session_id, max_sequence = scope
+        store = self.services.resources.artifacts
+        store.authorize(self.services, conversation_id, agent_id)
+        result = {}
+        for message in self.services.conversations.context_messages(conversation_id, session_id, max_sequence):
+            for attachment in message.attachments:
+                key = (attachment.version_id, attachment.path)
+                try:
+                    store.authorize(self.services, conversation_id, agent_id, version_id=attachment.version_id)
+                    if store.get(attachment.version_id)['state'] != 'ready':
+                        continue
+                except (NotFoundError, PermissionDeniedError):
+                    # Retained messages may outlive a released file or removed
+                    # collection reference. Only list currently readable files.
+                    continue
+                result[key] = {**attachment.model_dump(mode='json'), 'message_id': message.id,
+                    'sequence': message.sequence, 'conversation_id': conversation_id, 'session_id': session_id}
+        return sorted(result.values(), key=lambda entry: entry['sequence'])
+
+    async def conversation_attachments(self, agent_id, run_id):
+        async with self.services._node_mutation(read_only=True):
+            return self._conversation_attachment_entries(agent_id, run_id)
+
+    async def read_conversation_attachment(self, agent_id, run_id, version_id, path, *, max_bytes=32 * 1024 * 1024):
+        from contextlib import aclosing
+        from backend.errors import PermissionDeniedError
+        if type(max_bytes) is not int or not 0 < max_bytes <= 32 * 1024 * 1024:
+            raise ResourceValidationError('Attachment read limit must be between 1 byte and 32 MiB')
+
+        def authorize():
+            attachment = next((entry for entry in self._conversation_attachment_entries(agent_id, run_id)
+                if entry['version_id'] == version_id and entry['path'] == path), None)
+            if attachment is None:
+                raise PermissionDeniedError('Attachment is not in this Run\'s visible conversation history')
+            if attachment['size_bytes'] > max_bytes:
+                raise ResourceValidationError(f'Attachment exceeds the {max_bytes}-byte transfer limit')
+            return attachment
+
+        async with self.services._node_mutation(read_only=True):
+            attachment = authorize()
+        content = bytearray()
+        store = self.services.resources.artifacts
+        # ArtifactStore takes its own lock before graph access. Never hold the
+        # graph lock while awaiting its stream; reauthorize after every read.
+        async with aclosing(store.read(self.services, attachment['conversation_id'], version_id, path, agent_id)) as stream:
+            async for chunk in stream:
+                async with self.services._node_mutation(read_only=True):
+                    authorize()
+                if len(content) + len(chunk) > max_bytes:
+                    raise ResourceValidationError(f'Attachment exceeds the {max_bytes}-byte transfer limit')
+                content.extend(chunk)
+        async with self.services._node_mutation(read_only=True):
+            authorize()
+        return bytes(content)
+
+    async def publish_conversation_attachment(self, agent_id, run_id, name, data, *, request_key):
+        import hashlib
+        from backend.conversations.attachments import resolve
+        from backend.conversations.models import ConversationAttachmentRef
+        if not isinstance(data, bytes) or len(data) > 32 * 1024 * 1024:
+            raise ResourceValidationError('Runtime attachments must be bytes of at most 32 MiB')
+        if not isinstance(request_key, str) or not 1 <= len(request_key) <= 128:
+            raise ResourceValidationError('Attachment request_key must contain 1 to 128 characters')
+        async with self.services._node_mutation(read_only=True):
+            scope = self._conversation_file_scope(agent_id, run_id)
+            if scope is None:
+                raise ResourceValidationError('Publishing attachments requires an active conversation Run')
+            conversation_id, session_id, _ = scope
+
+        async def chunks():
+            from backend.sandbox.transfers import CHUNK_BYTES
+            for offset in range(0, len(data), CHUNK_BYTES):
+                yield data[offset:offset + CHUNK_BYTES]
+
+        record = await self.services.resources.artifacts.upload(self.services, conversation_id, session_id, name, chunks(),
+            agent_id=agent_id, run_id=run_id, request_key=request_key, expected_sha256=hashlib.sha256(data).hexdigest())
+        async with self.services._node_mutation(read_only=True):
+            if self._conversation_file_scope(agent_id, run_id) is None:
+                raise ResourceValidationError('Publishing attachments requires an active conversation Run')
+            attachment = resolve(self.services, conversation_id, session_id,
+                [ConversationAttachmentRef(version_id=record['version_id'], path=name)], agent_id)[0]
+            return {**attachment.model_dump(mode='json'), 'conversation_id': conversation_id, 'session_id': session_id}
 
     async def publish_execution(self, agent_id, run_id, snapshot):
         from backend.plugins.execution_graph import ExecutionSnapshot, MAX_EXECUTION_BYTES

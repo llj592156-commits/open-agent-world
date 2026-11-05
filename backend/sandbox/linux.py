@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .base import SandboxBackend, SandboxEventSink
+from .resource_validation import validate_resource_source
 from .materialization import RuntimeMount, materialize_bundle, cleanup_materializations
 from .linux_network import NETWORK_ERROR_MARKER, ca_bundle, network_payload, network_prerequisites
 from .models import (
@@ -162,7 +163,7 @@ def validate_relative_path(raw: str) -> str:
     return str(path)
 
 
-def minimal_linux_environment(extra: Mapping[str, str] | None = None, *, invocation_env: Mapping[str, str] | None = None) -> dict[str, str]:
+def minimal_linux_environment(extra: Mapping[str, str] | None = None, *, invocation_env: Mapping[str, object] | None = None) -> dict[str, str]:
     from .environment import validate_command_environment, apply_invocation_environment
     environment = {
         "PATH": "/sandbox/home/.local/bin:/sandbox/home/bin:/usr/bin:/bin", "HOME": "/sandbox/home", "TMPDIR": "/tmp",
@@ -175,7 +176,7 @@ def minimal_linux_environment(extra: Mapping[str, str] | None = None, *, invocat
         if not isinstance(extra, Mapping):
             raise SandboxValidationError("env must be an object")
         for key, value in extra.items():
-            if key not in {"LANG", "LC_ALL", "TZ", "TERM"}:
+            if key not in {"LANG", "LC_ALL", "TZ", "TERM"} or not isinstance(value, str):
                 raise SandboxValidationError(f"environment key is outside the allowlist: {key}")
             validate_command_environment({key: value})
             environment[key] = value
@@ -222,8 +223,9 @@ def bubblewrap_command(
     workspace: Path, access: ResourceAccess,
     attachments: Sequence[ResourceAttachment], argv: Sequence[str],
     environment: Mapping[str, str],
-    runtime_mount: tuple[Path, str] | None = None, *, network_enabled=False, python_runtime=None, home: Path | None = None, folder_mounts=(),
+    runtime_mount: tuple[Path, str] | None = None, *, network_enabled=False, python_runtime=None, home: Path | None = None, folder_mounts=(), working_directory="", workspace_write_directory=None,
 ) -> list[str]:
+    from .files import command_path
     result = [
         "/usr/bin/bwrap", "--unshare-all", "--unshare-user",
         "--die-with-parent", "--new-session", "--cap-drop", "ALL", "--clearenv",
@@ -251,9 +253,13 @@ def bubblewrap_command(
         if Path(name).exists():
             result.extend(("--ro-bind", name, name))
     result.extend((
-        "--ro-bind" if access == ResourceAccess.READ_ONLY else "--bind",
+        "--ro-bind" if access == ResourceAccess.READ_ONLY or workspace_write_directory is not None else "--bind",
         str(workspace), "/workspace",
     ))
+    from .workspace_access import writable_path, mount_access
+    if workspace_write_directory and access != ResourceAccess.READ_ONLY:
+        writable = writable_path(workspace, workspace_write_directory)
+        result.extend(('--bind', str(writable), command_path(workspace_write_directory)))
     # Attachments occupy an independent ephemeral tree: mounting one never
     # creates files in, shadows files in, or changes the selected real folder.
     result.extend(("--dir", "/sandbox", "--dir", "/sandbox/resources"))
@@ -262,7 +268,7 @@ def bubblewrap_command(
         for folder in folder_mounts:
             if folder.kind == "file":
                 result.extend(("--dir", str(Path(folder.linux_path).parent)))
-            result.extend(("--ro-bind" if folder.access == ResourceAccess.READ_ONLY else "--bind",
+            result.extend(("--ro-bind" if mount_access(workspace, folder.source, folder.access, workspace_write_directory) == ResourceAccess.READ_ONLY else "--bind",
                            folder.source, folder.linux_path))
     if home is not None:
         result.extend(("--bind", str(home), "/sandbox/home"))
@@ -270,7 +276,7 @@ def bubblewrap_command(
         result.extend(("--dir", "/sandbox/home"))
     for item in attachments:
         result.extend((
-            "--ro-bind" if item.access == ResourceAccess.READ_ONLY else "--bind",
+            "--ro-bind" if mount_access(workspace, item.source, item.access, workspace_write_directory) == ResourceAccess.READ_ONLY else "--bind",
             str(item.source), f"/sandbox/{item.relative_path}",
         ))
     if python_runtime is not None:
@@ -280,7 +286,7 @@ def bubblewrap_command(
         result.extend(("--ro-bind", str(source), f"/.oaw/{key}"))
     for key, value in environment.items():
         result.extend(("--setenv", key, value))
-    result.extend(("--chdir", "/workspace", "--remount-ro", "/", "--", *argv))
+    result.extend(("--chdir", command_path(working_directory), "--remount-ro", "/", "--", *argv))
     return result
 
 
@@ -313,6 +319,7 @@ class _Record:
 
 
 class LinuxSandboxBackend(SandboxBackend):
+    supports_workspace_scopes = True
     supports_invocation_environment = True
     supports_folder_mounts = True
     supports_execution_policy = True
@@ -498,10 +505,11 @@ class LinuxSandboxBackend(SandboxBackend):
         self, record: _Record, sandbox_id: str, argv: Sequence[str], *,
         timeout_seconds: float | None = None, env: Mapping[str, str] | None = None,
         _unit_name: str | None = None,
-        invocation_env: Mapping[str, str] | None = None,
+        invocation_env: Mapping[str, object] | None = None,
         runtime_mount: RuntimeMount | None = None,
         folder_mounts=(),
         execution_policy: Mapping[str, Any] | None = None,
+        working_directory: str = "", workspace_write_directory: str | None = None,
     ) -> CommandResult:
         policy = execution_policy or {}
         if type(policy.get("network_enabled", False)) is not bool:
@@ -537,8 +545,10 @@ class LinuxSandboxBackend(SandboxBackend):
                 command = runtime_mount.command(command, Path("/.oaw") / runtime_mount.bundle.key)
                 source = materialize_bundle(record.root, runtime_mount.bundle.versioned())
                 mount = (source, runtime_mount.bundle.key)
+            from .files import working_path
+            working_path(record.host_workspace, working_directory)
             isolated = bubblewrap_command(record.host_workspace, record.workspace_access,
-                tuple(record.attachments.values()), command, environment, mount, network_enabled=bool(policy.get("network_enabled")), python_runtime=self.python_runtime, home=record.root / "home", folder_mounts=folder_mounts)
+                tuple(record.attachments.values()), command, environment, mount, network_enabled=bool(policy.get("network_enabled")), python_runtime=self.python_runtime, home=record.root / "home", folder_mounts=folder_mounts, working_directory=working_directory, workspace_write_directory=workspace_write_directory)
             invocation = service_command(isolated, unit, limits, timeout, network_enabled=bool(policy.get("network_enabled")))
             record.state = SandboxState.RUNNING
             record.active_command, record.unit = command, unit
@@ -937,18 +947,7 @@ class LinuxSandboxBackend(SandboxBackend):
                         raise SandboxValidationError(f"workspace contains a hard-linked file: {entry.path}")
 
     def _validate_source(self, source: Path, *, must_exist: bool = True) -> Path:
-        if source.is_symlink():
-            raise SandboxValidationError("resource symlinks are not allowed")
-        try:
-            resolved = source.resolve(strict=must_exist)
-        except OSError as exc:
-            raise SandboxValidationError("managed resource does not exist") from exc
-        self._assert_within(resolved, self._managed_root)
-        if (any(resolved.is_relative_to(self._managed_root / name)
-                for name in ("sandbox-runtimes", "sandboxes", "sandbox-bindings", "runtime"))
-                or (must_exist and not resolved.is_file())):
-            raise SandboxValidationError("only regular managed resource files can be attached")
-        return resolved
+        return validate_resource_source(source, self._managed_root, must_exist=must_exist)
 
     def _validate_record_paths(self, record: _Record) -> None:
         self._assert_within(record.root.resolve(), self._root)

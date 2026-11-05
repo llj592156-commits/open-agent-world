@@ -4,16 +4,18 @@ import { t, useLocale } from '../i18n';
 import { configureWorkspaceApi, normalizeCard, normalizeEdge } from '../api/client';
 import { WorkspaceWindow } from '../legions/LegionWorkspace';
 import { WorkspaceAccess, type PluginDeploymentAccess } from '../workspace/WorkspaceAccess';
-import { useWorldStore } from '../state/worldStore';
+import { isOlder, useWorldStore } from '../state/worldStore';
 import { ToastStack } from '../shell/ToastStack';
+import { BackendUnavailableNotice } from '../shell/BackendUnavailableNotice';
 import type { PluginCatalog, WorldCard, WorldEdge } from '../types/world';
 import { deploymentRequest } from './api';
 import './deployment.css';
 import { isHosted } from '../auth/hostedSession';
 import { AccountButton } from '../auth/AccountButton';
+import { useApplicationAppearance } from '../shell/useAppearance';
 
 type PublishedWorkspace = {
-  id: string; name: string; cards: WorldCard[]; legion: WorldCard;
+  id: string; name: string; cards: WorldCard[]; legion: WorldCard; legions?: WorldCard[];
   catalog: PluginCatalog; permissions: Record<string, string[]>;
   plugin_access?: Record<string, PluginDeploymentAccess>;
   edges?: WorldEdge[];
@@ -21,9 +23,11 @@ type PublishedWorkspace = {
 
 /** Authentication and scoped data bootstrap; all workspace rendering stays shared. */
 export function RuntimeApp({ name }: { name: string }) {
+  useApplicationAppearance();
   const locale = useLocale(state => state.locale);
   const theme = useWorldStore(state => state.theme);
   const [app, setApp] = useState<PublishedWorkspace>();
+  const [activeId, setActiveId] = useState<string>();
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -37,10 +41,12 @@ export function RuntimeApp({ name }: { name: string }) {
   const load = async () => {
     const value = await deploymentRequest<PublishedWorkspace>('/runtime-app');
     configureWorkspaceApi(true);
-    const legion = normalizeCard(value.legion);
-    useWorldStore.setState({ cards: [legion, ...value.cards.map(normalizeCard)], catalog: value.catalog,
+    const legions = (value.legions ?? [value.legion]).map(normalizeCard);
+    const legion = legions[0];
+    useWorldStore.setState({ cards: [...legions, ...value.cards.map(normalizeCard)], catalog: value.catalog,
       edges: (value.edges ?? []).map(normalizeEdge), events: [], socketState: 'closed', syncState: 'online' });
-    setApp({ ...value, legion });
+    setActiveId(legion.id);
+    setApp({ ...value, legion, legions });
   };
   useEffect(() => {
     let active = true;
@@ -53,12 +59,15 @@ export function RuntimeApp({ name }: { name: string }) {
     if (!app) return;
     const controller = new AbortController();
     const timer = window.setInterval(() => {
+      const before = new Map(useWorldStore.getState().cards.map(card => [card.id, card]));
       void deploymentRequest<PublishedWorkspace>('/runtime-app', { signal: controller.signal }).then(value => {
         if (controller.signal.aborted) return;
         const byId = new Map(value.cards.map(card => [card.id, card]));
         useWorldStore.setState(state => ({ cards: state.cards.map(card => {
           const live = byId.get(card.id);
-          return live ? { ...card, status: live.status, config: { ...card.config, ...live.config } } : card;
+          // An edit (including an optimistic save) made during this read wins.
+          return live && before.get(card.id) === card && !isOlder(live, card)
+            ? { ...card, revision: live.revision, status: live.status, config: { ...card.config, ...live.config } } : card;
         }) }));
       }).catch(() => {});
     }, 3000);
@@ -84,10 +93,11 @@ export function RuntimeApp({ name }: { name: string }) {
     <button className="primary-button" disabled={busy}>{busy ? t('Signing in…') : t('Open application')}</button>
   </form></main>;
   return <WorkspaceAccess.Provider value={{ deployed: true, permissions: app.permissions, plugin_access: app.plugin_access }}>
-    <WorkspaceWindow key={app.id} card={app.legion} locked actions={isHosted() ? <AccountButton /> : <button className="secondary-button" onClick={() => {
+    <WorkspaceWindow key={`${app.id}:${activeId}`} card={app.legions!.find(card => card.id === activeId)!} workspaces={app.legions} onSwitch={setActiveId} locked actions={isHosted() ? <AccountButton /> : <button className="secondary-button" onClick={() => {
       void deploymentRequest('/runtime-app/session', { method: 'DELETE' }).then(clear)
         .catch(reason => useWorldStore.getState().pushToast({ tone: 'error', title: reason.message }));
     }}><LogOut size={14} />{t('Sign out')}</button>} />
     <ToastStack />
+    <BackendUnavailableNotice />
   </WorkspaceAccess.Provider>;
 }

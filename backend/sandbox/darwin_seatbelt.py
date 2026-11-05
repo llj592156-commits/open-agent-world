@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .base import SandboxBackend, SandboxEventSink
+from .resource_validation import validate_resource_source
 from .materialization import RuntimeMount, materialize_bundle, cleanup_materializations
 from .darwin_network_proxy import SeatbeltProxySession
 from .models import (
@@ -122,7 +123,7 @@ def seatbelt_profile(
     python_runtime: Path | Sequence[Path] | None = None,
     *,
     workspace_access: ResourceAccess = ResourceAccess.READ_WRITE,
-    proxy_ports: Sequence[int] = (),
+    proxy_ports: Sequence[int] = (), workspace_write_directory: str | None = None,
 ) -> str:
     """Generate a deny-default Seatbelt profile for one command execution.
 
@@ -143,7 +144,11 @@ def seatbelt_profile(
     # remain private command scratch space and therefore stay writable.
     read_subpaths.append(str(workspace))
     if workspace_access == ResourceAccess.READ_WRITE:
-        write_subpaths.append(str(workspace))
+        if workspace_write_directory is None:
+            write_subpaths.append(str(workspace))
+        elif workspace_write_directory:
+            from .workspace_access import writable_path
+            write_subpaths.append(str(writable_path(workspace, workspace_write_directory)))
     for managed in (home, tmpdir):
         read_subpaths.append(str(managed))
         write_subpaths.append(str(managed))
@@ -151,7 +156,8 @@ def seatbelt_profile(
     for attachment in attachments:
         source = str(attachment.source)
         read_subpaths.append(source)
-        if attachment.access == ResourceAccess.READ_WRITE:
+        from .workspace_access import mount_access
+        if mount_access(workspace, attachment.source, attachment.access, workspace_write_directory) == ResourceAccess.READ_WRITE:
             write_subpaths.append(source)
 
     if runtime_mount is not None:
@@ -226,7 +232,7 @@ def minimal_darwin_environment(
     home: Path, tmpdir: Path,
     extra: Mapping[str, str] | None = None, *,
     resources: Path | None = None,
-    invocation_env: Mapping[str, str] | None = None,
+    invocation_env: Mapping[str, object] | None = None,
 ) -> dict[str, str]:
     from .environment import validate_command_environment, apply_invocation_environment
     environment = {
@@ -236,12 +242,20 @@ def minimal_darwin_environment(
         "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "SHELL": "/bin/sh",
         "SANDBOX_RESOURCES": str(resources) if resources is not None else "",
         "NPM_CONFIG_PREFIX": f"{home}/.local",
+        # Configure libraries before Pack import checks as well as user code.
+        # System font helpers can depend on host libraries outside this profile;
+        # Matplotlib versions supporting this setting use their bundled fonts.
+        "MPLCONFIGDIR": str(home / ".cache" / "matplotlib"),
+        "MPL_IGNORE_SYSTEM_FONTS": "1",
+        # Seatbelt does not grant the named semaphores Joblib probes. Declare
+        # that limitation instead of repeating a failed multiprocessing probe.
+        "JOBLIB_MULTIPROCESSING": "0",
     }
     if extra is not None:
         if not isinstance(extra, Mapping):
             raise SandboxValidationError("env must be an object")
         for key, value in extra.items():
-            if key not in {"LANG", "LC_ALL", "TZ", "TERM"}:
+            if key not in {"LANG", "LC_ALL", "TZ", "TERM"} or not isinstance(value, str):
                 raise SandboxValidationError(f"environment key is outside the allowlist: {key}")
             validate_command_environment({key: value})
             environment[key] = value
@@ -290,9 +304,12 @@ class DarwinSeatbeltBackend(SandboxBackend):
     intentionally no subprocess or path-only fallback.
     """
 
+    supports_workspace_scopes = True
     supports_invocation_environment = True
     supports_execution_policy = True
-    supports_optional_python_runtime = True
+    # Like Windows, ordinary commands, shells and installed CLIs all use the
+    # managed Python environment. There is no implicit host-Python fallback.
+    supports_optional_python_runtime = False
 
     def __init__(
         self, managed_root: Path, *,
@@ -596,11 +613,13 @@ class DarwinSeatbeltBackend(SandboxBackend):
     async def _execute_record(
         self, owner: _Record, execution: _Execution, sandbox_id: str, argv: Sequence[str], *,
         timeout_seconds: float | None = None, env: Mapping[str, str] | None = None,
-        invocation_env: Mapping[str, str] | None = None,
+        invocation_env: Mapping[str, object] | None = None,
         runtime_mount: RuntimeMount | None = None,
         execution_policy: Mapping[str, Any] | None = None,
         managed_python: bool = True,
+        working_directory: str = "", workspace_write_directory: str | None = None,
     ) -> CommandResult:
+        from .files import working_path
         policy = execution_policy or {}
         self.validate_execution_policy(policy)
         if type(managed_python) is not bool:
@@ -665,7 +684,7 @@ class DarwinSeatbeltBackend(SandboxBackend):
             tuple(owner.attachments.values()), mount,
             ((self.python_runtime.base, self.python_runtime.venv)
                 if managed_python and self.python_runtime else None),
-            workspace_access=owner.workspace_access,
+            workspace_access=owner.workspace_access, workspace_write_directory=workspace_write_directory,
             proxy_ports=execution.proxy.ports if execution.proxy else (),
         )
 
@@ -695,7 +714,7 @@ class DarwinSeatbeltBackend(SandboxBackend):
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 env=environment,
-                cwd=str(workspace),
+                cwd=str(working_path(workspace, working_directory)),
                 limit=32 * 1024 * 1024)
             execution.process = process
             assert process.stdout and process.stderr
@@ -932,18 +951,7 @@ class DarwinSeatbeltBackend(SandboxBackend):
         return str(resolved)
 
     def _validate_source(self, source: Path, *, must_exist: bool = True) -> Path:
-        if source.is_symlink():
-            raise SandboxValidationError("resource symlinks are not allowed")
-        try:
-            resolved = source.resolve(strict=must_exist)
-        except OSError as exc:
-            raise SandboxValidationError("managed resource does not exist") from exc
-        self._assert_within(resolved, self._managed_root)
-        if (any(resolved.is_relative_to(self._managed_root / name)
-                for name in ("sandbox-runtimes", "sandboxes", "sandbox-bindings", "runtime"))
-                or (must_exist and not resolved.is_file())):
-            raise SandboxValidationError("only regular managed resource files can be attached")
-        return resolved
+        return validate_resource_source(source, self._managed_root, must_exist=must_exist)
 
     def _validate_record_paths(self, record: _Record) -> None:
         self._assert_within(record.root.resolve(), self._root)

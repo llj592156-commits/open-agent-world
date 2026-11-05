@@ -86,11 +86,22 @@ jobs:
             install_args+=(--editable "$plugin_root")
           done
           uv pip install --python .venv/bin/python "${install_args[@]}"
+      - name: Prepare declared Report rendering test dependencies
+        run: |
+          backend/.venv/bin/python - <<'PY'
+          import subprocess
+          import tomllib
+          from pathlib import Path
+          spec = tomllib.loads(Path('plugins/atomsculptor/oaw.pack.toml').read_text())
+          requirements = spec['environments']['log-review']['python']
+          subprocess.run(['uv', 'pip', 'install', '--python', 'backend/.venv/bin/python', *requirements], check=True)
+          PY
       - name: Strict optional plugin activation
         run: backend/.venv/bin/python -c "from backend.plugins.loader import load_plugin_registry; load_plugin_registry(strict=True)"
       - name: Run backend and public SDK test suites
         run: >-
           backend/.venv/bin/python .github/run-backend-tests.py tests backend/tests packs/codex/tests
+          plugins/atomsculptor/tests/test_log_review_agent.py
           --shard ${{ matrix.shard }}/4 --durations=20
           --junitxml=.tmp/backend-linux-${{ matrix.shard }}.xml
       - name: Upload backend results
@@ -139,11 +150,20 @@ jobs:
       - name: Install UI acceptance browsers
         working-directory: frontend
         run: npx --no-install playwright install --with-deps chromium webkit
-      - name: Pack the public SDK and build external Greeter
+      - name: Pack the public SDK
+        id: pack-sdk
         run: |
           mkdir -p .outputs
-          npm pack ./frontend/pack-sdk --pack-destination .outputs
-          backend/.venv/bin/python scripts/build-external-greeter.py
+          npm pack ./frontend/pack-sdk --pack-destination .outputs --json > .outputs/pack-sdk.json
+          node --input-type=module <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const [sdk] = JSON.parse(readFileSync('.outputs/pack-sdk.json', 'utf8'));
+          appendFileSync(process.env.GITHUB_OUTPUT, `path=.outputs/${sdk.filename}\nversion=${sdk.version}\n`);
+          JS
+      - name: Build external Greeter with the packaged SDK
+        env:
+          OAW_PACK_SDK: ${{ steps.pack-sdk.outputs.path }}
+        run: backend/.venv/bin/python scripts/build-external-greeter.py --sdk "$OAW_PACK_SDK"
       - name: Install external Pack and verify cards and assets after restart
         working-directory: frontend
         env:
@@ -152,14 +172,15 @@ jobs:
       - name: Upload the versioned public Pack SDK
         uses: actions/upload-artifact@v4
         with:
-          name: oaw-plugin-api-1.0.0-${{ github.sha }}
-          path: .outputs/oaw-plugin-api-1.0.0.tgz
+          name: oaw-plugin-api-${{ steps.pack-sdk.outputs.version }}-${{ github.sha }}
+          path: ${{ steps.pack-sdk.outputs.path }}
           if-no-files-found: error
       - name: Build and install an external declarative Pack
         env:
           PLAYWRIGHT_CHANNEL: chromium
+          OAW_PACK_SDK: ${{ steps.pack-sdk.outputs.path }}
         run: |
-          backend/.venv/bin/python scripts/build-external-notes.py
+          backend/.venv/bin/python scripts/build-external-notes.py --sdk "$OAW_PACK_SDK"
           node frontend/scripts/run-pack-e2e.mjs --declarative
       - name: Run deployment acceptance against production frontend
         working-directory: frontend

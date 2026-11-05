@@ -1,13 +1,16 @@
 // @vitest-environment jsdom
 import { useState } from 'react';
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, test, vi } from 'vitest';
-import { WorkspaceWindow } from './LegionWorkspace';
+import { LegionWorkspace, WorkspaceWindow } from './LegionWorkspace';
 import { WorkspaceSection } from '../workspace/WorkspaceSection';
 import { useWorldStore } from '../state/worldStore';
+import { useLegionWorkspace } from '../state/legionWorkspace';
 import { useLocale } from '../i18n';
 import type { WorldCard } from '../types/world';
 import { useWorkspaceNavigation, type WorkspaceNavigation } from '../workspace/WorkspaceNavigation';
+import { useInteractionEnvironment } from '../interaction/environment';
+import { WorkspaceAccess } from '../workspace/WorkspaceAccess';
 
 let navigation: WorkspaceNavigation | undefined;
 
@@ -31,7 +34,7 @@ function ConditionalCard({ card }: { card: WorldCard }) {
 }
 
 const initialStore = useWorldStore.getState();
-afterEach(() => { cleanup(); useWorldStore.setState(initialStore, true); vi.restoreAllMocks(); });
+afterEach(() => { cleanup(); useWorldStore.setState(initialStore, true); useLegionWorkspace.setState({ activeId: undefined }); useInteractionEnvironment.setState({ compact: false }); vi.restoreAllMocks(); });
 
 test('conditional sections retain geometry while missing, accept explicit new hints and forget removed owners', () => {
   Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } });
@@ -96,4 +99,115 @@ test('operation activation reveals existing tabs without saving geometry or rese
   expect(screen.getByRole('button', { name: 'drawer' }).getAttribute('aria-expanded')).toBe('true');
   fireEvent.click(screen.getByRole('button', { name: 'Edit layout' }));
   act(() => expect(navigation?.activate({ card_id: 'owner', section_id: 'graph' })).toBe(false));
+});
+
+test('switching protects unsaved layouts and only switches after a successful save', async () => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } });
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } });
+  useLocale.setState({ locale: 'en' });
+  const member = { id: 'neighbor', name: 'Neighbor', type: 'sandbox', parent_id: 'team', config: {} } as WorldCard;
+  const team: WorldCard = { id: 'team', name: 'Team', type: 'legion', position: { x: 0, y: 0 }, size: { width: 800, height: 550 }, expanded: false, status: 'available', config: { workspace_layout: { version: 2, root: { kind: 'pane', view: { card_id: member.id } } } } };
+  const other = { ...team, id: 'operations', name: 'Operations', config: {} };
+  const updateCard = vi.fn().mockRejectedValueOnce(new Error('Save failed')).mockImplementation(async (id, patch) => {
+    useWorldStore.setState(state => ({ cards: state.cards.map(card => card.id === id ? { ...card, config: { ...card.config, ...patch.config } } : card) }));
+  });
+  useWorldStore.setState({ cards: [team, member, other], catalog: { plugins: [], packs: [], relationships: [], node_types: [] }, updateCard });
+  useLegionWorkspace.setState({ activeId: team.id });
+  render(<LegionWorkspace />);
+  fireEvent.click(screen.getByRole('button', { name: 'Edit layout' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Remove Neighbor from layout' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Switch workspace' }));
+  fireEvent.click(screen.getByRole('menuitemradio', { name: 'Operations' }));
+  expect(useLegionWorkspace.getState().activeId).toBe('team');
+  fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Switch workspace' }));
+  fireEvent.click(screen.getByRole('menuitemradio', { name: 'Operations' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Save and switch' }));
+  await screen.findByText('Save failed');
+  expect(useLegionWorkspace.getState().activeId).toBe('team');
+  fireEvent.click(screen.getByRole('button', { name: 'Save and switch' }));
+  await waitFor(() => expect(useLegionWorkspace.getState().activeId).toBe('operations'));
+  fireEvent.click(screen.getByRole('button', { name: 'Switch workspace' }));
+  fireEvent.keyDown(screen.getByRole('menu'), { key: 'Home' });
+  fireEvent.click(screen.getByRole('menuitemradio', { name: 'Team' }));
+  expect(useLegionWorkspace.getState().activeId).toBe('team');
+});
+
+test('compact navigation shows one full-size live view and preserves drafts across views and screen sizes without saving desktop layout', () => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } });
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } });
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() });
+  useLocale.setState({ locale: 'en' });
+  useInteractionEnvironment.setState({ compact: true });
+  const makeCard = (id: string): WorldCard => ({ id, type: 'sandbox', name: id, parent_id: 'team',
+    position: { x: 0, y: 0 }, size: { width: 300, height: 200 }, expanded: false, status: 'available', config: {} });
+  const layout = { version: 2, hidden_sections: [], root: { kind: 'split', axis: 'horizontal', ratio: .35,
+    first: { kind: 'pane', view: { card_id: 'owner' } }, second: { kind: 'tabs',
+      views: [{ card_id: 'neighbor' }, { card_id: 'owner', section_id: 'graph' }], active_view: { card_id: 'neighbor' } } } };
+  const team: WorldCard = { ...makeCard('team'), type: 'legion', parent_id: null, config: { workspace_layout: layout } };
+  const updateCard = vi.fn();
+  useWorldStore.setState({ cards: [team, makeCard('owner'), makeCard('neighbor'), makeCard('drawer')], catalog: { plugins: [], packs: [], relationships: [], node_types: [] }, updateCard });
+  const view = render(<WorkspaceWindow card={team} />);
+  const key = (card_id: string, section_id?: string) => JSON.stringify([card_id, section_id ?? null]);
+  const picker = screen.getByRole('combobox', { name: 'Workspace views' });
+  expect(view.container.querySelector<HTMLElement>('.legion-layout-root')!.style.minWidth).toBe('');
+  expect(screen.queryByRole('separator')).toBeNull();
+  expect(view.container.querySelectorAll('.legion-compact-pane:not([hidden])')).toHaveLength(1);
+  fireEvent.change(picker, { target: { value: key('owner', 'graph') } });
+  fireEvent.change(screen.getByRole('textbox', { name: 'Retained draft' }), { target: { value: 'kept on phone' } });
+  fireEvent.change(picker, { target: { value: key('drawer') } });
+  expect(screen.queryByRole('textbox', { name: 'Retained draft' })).toBeNull();
+  act(() => expect(navigation?.activate({ card_id: 'owner', section_id: 'graph' })).toBe(true));
+  expect((screen.getByRole('textbox', { name: 'Retained draft' }) as HTMLInputElement).value).toBe('kept on phone');
+  act(() => useInteractionEnvironment.setState({ compact: false }));
+  expect(screen.getByRole('tab', { name: 'neighbor' }).getAttribute('aria-selected')).toBe('true');
+  act(() => useInteractionEnvironment.setState({ compact: true }));
+  expect((screen.getByRole('textbox', { name: 'Retained draft' }) as HTMLInputElement).value).toBe('kept on phone');
+  expect(updateCard).not.toHaveBeenCalled();
+  expect(useWorldStore.getState().cards[0].config.workspace_layout).toBe(layout);
+});
+
+test('published compact navigation excludes unplaced, hidden and unpermitted sections', () => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } });
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } });
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() });
+  useLocale.setState({ locale: 'en' });
+  useInteractionEnvironment.setState({ compact: true });
+  const makeCard = (id: string): WorldCard => ({ id, type: 'sandbox', name: id, parent_id: 'team',
+    position: { x: 0, y: 0 }, size: { width: 300, height: 200 }, expanded: false, status: 'available', config: {} });
+  const layout = { version: 2, hidden_sections: [{ card_id: 'owner', section_id: 'hidden' }], root: { kind: 'split', axis: 'horizontal', ratio: .5,
+    first: { kind: 'pane', view: { card_id: 'neighbor' } }, second: { kind: 'pane', view: { card_id: 'owner', section_id: 'graph' } } } };
+  const team: WorldCard = { ...makeCard('team'), type: 'legion', parent_id: null, config: { workspace_layout: layout } };
+  const updateCard = vi.fn();
+  useWorldStore.setState({ cards: [team, makeCard('owner'), makeCard('neighbor'), makeCard('drawer')], catalog: { plugins: [], packs: [], relationships: [], node_types: [] }, updateCard });
+  render(<WorkspaceAccess.Provider value={{ deployed: true, permissions: { owner: [], neighbor: [] }, plugin_access: { owner: {
+    config_fields: [], document_fields: [], summary_fields: [], document_actions: [], downloads: [], resource_actions: {}, execution: false, shared_sections: false,
+  } } }}><WorkspaceWindow card={team} locked /></WorkspaceAccess.Provider>);
+  expect(screen.getAllByRole('option').map(option => option.textContent)).toEqual(['neighbor']);
+  expect(screen.queryByText('Graph content')).toBeNull();
+  for (const requested of [{ card_id: 'drawer' }, { card_id: 'owner' }, { card_id: 'owner', section_id: 'graph' }, { card_id: 'owner', section_id: 'hidden' }]) {
+    act(() => expect(navigation?.activate(requested)).toBe(false));
+  }
+  expect(screen.queryByRole('button', { name: 'Edit layout' })).toBeNull();
+  expect(updateCard).not.toHaveBeenCalled();
+});
+
+test('an unconfigured compact workspace can browse members before explicitly editing a layout', () => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function (this: HTMLDialogElement) { this.open = true; } });
+  Object.defineProperty(HTMLDialogElement.prototype, 'close', { configurable: true, value: function (this: HTMLDialogElement) { this.open = false; } });
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() });
+  useLocale.setState({ locale: 'en' });
+  useInteractionEnvironment.setState({ compact: true });
+  const member = { id: 'neighbor', name: 'Neighbor', type: 'sandbox', parent_id: 'team', config: {} } as WorldCard;
+  const team = { ...member, id: 'team', name: 'Team', type: 'legion', parent_id: null, config: {} };
+  const updateCard = vi.fn();
+  useWorldStore.setState({ cards: [team, member], catalog: { plugins: [], packs: [], relationships: [], node_types: [] }, updateCard });
+  render(<WorkspaceWindow card={team} />);
+  expect(screen.getByText('Neighbor content')).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Save layout' })).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Edit layout' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Workspace cards' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Compose all cards' }));
+  expect(screen.getByText('Unsaved layout')).toBeTruthy();
+  expect(updateCard).not.toHaveBeenCalled();
 });

@@ -1,11 +1,12 @@
 import { startXrdWorkflow } from './xrdWorkflowImport';
 import { useCardStateSession } from "../state/cardState";
+import { useWorkspaceContext } from '../state/workspaceContext';
 import { t, useLocale } from "../i18n";
 import { Component, Suspense, useMemo, type ReactNode } from "react";
 import { worldApi, nodeDocumentDownloadUrl } from "../api/client";
 import { useWorldStore } from "../state/worldStore";
 import { surfaceDraftKey, useNodeSurfaceStore } from "../state/nodeSurfaces";
-import { useOpenFiles } from "../state/openFiles";
+import { FileWorkspaceContext, useOpenFiles } from "../state/openFiles";
 import type { WorldCard } from "../types/world";
 import { pluginView } from "./registry";
 import { xrdCanvasSource } from './xrdCanvasSource';
@@ -62,14 +63,31 @@ export function PluginSurface({ card, slot, level, children }: {
   const sessionId = useCardStateSession(card.id);
   const inWorkspace = useContext(WorkspaceSurfaceContext);
   const navigation = useWorkspaceNavigation();
-  const executionSources = useExecutionSources(card.id, access.deployed);
+  // Deployed requests use /runtime-app/workspace; its server validates both the
+  // owning card and every connected source (test_default_publication.py).
+  const executionSources = useExecutionSources(card.id, access.deployed && !(card.id in access.permissions));
   const covered = useLegionWorkspace(s => Boolean(s.activeId));
   const definition = useWorldStore((s) => s.catalog.node_types.find((d) => d.id === card.type));
+  // Catalog refreshes replace definitions. Rebind the host only when its capabilities change,
+  // so views depending on SDK callbacks keep their loaded content and local edits.
+  const stateless = definition?.state?.mode === 'none';
+  const credentialConfiguration = Boolean(definition?.traits.some(trait => trait === 'core.environment' || trait === 'core.sandbox'));
+  const configurablePersistence = Boolean(definition?.state?.mode === 'scoped' && definition.state.userConfigurable && definition.state.supportedScopes.length > 1);
+  const followsWorkspace = definition?.state?.mode === 'scoped' && definition.state.followWorkspace;
+  const followsFiles = useWorldStore(state => state.edges.some(edge => edge.source === card.id
+    && edge.relationship === 'core.file-preview' && state.catalog.node_types.find(type => type.id === state.cards.find(node => node.id === edge.target)?.type)?.traits.includes('core.sandbox')));
+  const scopedView = followsWorkspace || followsFiles;
+  const workspace = useWorkspaceContext(card.id, !!scopedView && !card.ephemeral);
+  const viewKey = scopedView ? workspace.value?.key : sessionId;
   const runtime = useWorldStore((s) => definition ? s.catalog.frontend_modules?.[definition.plugin_id] : undefined);
   const updateCard = useWorldStore((s) => s.updateCard);
   const source = useWorldStore(s=>xrdCanvasSource(card,s.cards,s.edges));
   const viewCard = useMemo(()=>source?{...card,config:{...card.config,source_node_id:source}}:card,[card,source]);
   const host = useMemo<PluginViewProps["host"]>(() => ({
+    credentials: !access.deployed && credentialConfiguration ? {
+      status: () => worldApi.getCredentialBindings(card.id),
+      set: (reference, value, expectedRevision) => worldApi.bindCredential(card.id, reference, value, expectedRevision),
+    } : undefined,
     executionSources,
     workspace: inWorkspace && navigation ? { activate: view => navigation.activate({ ...view, card_id: view?.card_id ?? card.id }) } : undefined,
     dataSources: access.deployed ? undefined : {
@@ -92,22 +110,22 @@ export function PluginSurface({ card, slot, level, children }: {
     },
     draft: {
       get: () => {
-        const value = useNodeSurfaceStore.getState().drafts[surfaceDraftKey(card.id, 'plugin', card.state_scope, sessionId)];
+        const value = useNodeSurfaceStore.getState().drafts[surfaceDraftKey(card.id, 'plugin', card.state_scope, viewKey)];
         return value ? JSON.parse(value) as Record<string, unknown> : undefined;
       },
-      set: value => useNodeSurfaceStore.getState().setDraft(surfaceDraftKey(card.id, 'plugin', card.state_scope, sessionId), value ? JSON.stringify(value) : ''),
+      set: value => useNodeSurfaceStore.getState().setDraft(surfaceDraftKey(card.id, 'plugin', card.state_scope, viewKey), value ? JSON.stringify(value) : ''),
       subscribe: listener => {
-        const key = surfaceDraftKey(card.id, 'plugin', card.state_scope, sessionId);
+        const key = surfaceDraftKey(card.id, 'plugin', card.state_scope, viewKey);
         return useNodeSurfaceStore.subscribe((state, previous) => { if (state.drafts[key] !== previous.drafts[key]) listener(); });
       },
     },
-    state: access.deployed || definition?.state?.mode === 'none' ? undefined : {
+    state: (access.deployed && !(card.id in access.permissions)) || stateless ? undefined : {
       get: () => worldApi.cardState(card.id, 'GET', undefined, undefined, sessionId ?? null),
       set: (value, revision) => worldApi.cardState(card.id, 'PUT', value, revision, sessionId ?? null),
       update: (value, revision) => worldApi.cardState(card.id, 'PATCH', value, revision, sessionId ?? null),
       delete: (revision) => worldApi.cardState(card.id, 'DELETE', undefined, revision, sessionId ?? null),
     },
-    setDataPersistence: !access.deployed && definition?.state?.mode === 'scoped' && definition.state.userConfigurable && definition.state.supportedScopes.length > 1
+    setDataPersistence: !access.deployed && configurablePersistence
       ? async value => { await updateCard(card.id, { state_scope: value }); } : undefined,
     deployment: access.plugin_access?.[card.id],
     ...multiphaseHost(source ?? card.id),
@@ -143,7 +161,7 @@ export function PluginSurface({ card, slot, level, children }: {
           await worldApi.editCardLibrary({action:'open_pack', id:'research.xrd.default', expected_revision:library.revision});
         }
         const origin = world.nodes.find(n => n.id === card.id);
-        target = await state.createCard(type, {x:(origin?.position.x ?? 0)+1600, y:(origin?.position.y ?? 0)+(type === 'xrd.structure-canvas' ? 650 : 0)});
+        target = await state.createCard(type, {x:(origin?.position.x ?? 0)+1600, y:(origin?.position.y ?? 0)+(type === 'xrd.structure-canvas' ? 650 : 0)}, { parent_id: origin?.parent_id });
         if (!target) throw new Error('无法创建画布');
         await state.updateCard(target.id, {name, config:{source_node_id:card.id}}, {throwOnError:true});
       }
@@ -172,7 +190,7 @@ export function PluginSurface({ card, slot, level, children }: {
       let canvas=current?.type==='xrd.spectrum-canvas'?current:world.nodes.find(n=>n.type==='xrd.spectrum-canvas' &&
         (n.config.source_node_id===owner!.id || world.edges.some(e=>e.relationship==='xrd.frames'&&e.source===owner!.id&&e.target===n.id)));
       if(!canvas){
-        canvas=await state.createCard('xrd.spectrum-canvas',owner.position)??undefined;
+        canvas=await state.createCard('xrd.spectrum-canvas',owner.position,{parent_id:owner.parent_id})??undefined;
         if(!canvas)throw Error('无法创建谱画布');
         await state.updateCard(canvas.id,{config:{source_node_id:owner.id},parent_id:owner.parent_id},{throwOnError:true});
       }
@@ -195,13 +213,13 @@ export function PluginSurface({ card, slot, level, children }: {
       useWorldStore.getState().selectCards([nodeId], { syncCanvas: true });
       useNodeSurfaceStore.getState().openWorkspace(nodeId);
     },
-    runAgent: (nodeId, prompt) => useWorldStore.getState().runAgent(nodeId, prompt),
+    runAgent: (nodeId, prompt, freshContext) => useWorldStore.getState().runAgent(nodeId, prompt, freshContext),
     onDocumentChange: subscribeToDocumentChanges,
     registerVisualCapture: (captureKind, capture) => registerPluginVisualCapture(card.id, captureKind, capture),
     delegationAction: (action, arguments_) => worldApi.nodeDelegationAction(card.id, action, arguments_, sessionId ?? null),
     resourceAction: (action, arguments_, confirm) => worldApi.nodeResourceAction(card.id, action, arguments_, confirm, sessionId ?? null),
     readFile: (reference, signal) => worldApi.readFilePreview(card.id, reference, signal),
-    openFile: (reference, name, options) => useOpenFiles.getState().open({ ...reference, source_id: card.id }, name, options),
+    openFile: (reference, name, options) => useOpenFiles.getState().open({ ...reference, source_id: card.id }, name, { ...options, workspaceKey: scopedView ? viewKey : undefined }),
     openInputNode: async (type, name, source, relationship) => {
       // Reuse an imported source by exact bytes, including after a page reload.
       const state = useWorldStore.getState();
@@ -213,7 +231,7 @@ export function PluginSurface({ card, slot, level, children }: {
       }
       if (!target) {
         const origin = nodes.find(node => node.id === card.id);
-        target = await state.createCard(type, { x: (origin?.position.x ?? 0) + 1100, y: origin?.position.y ?? 0 });
+        target = await state.createCard(type, { x: (origin?.position.x ?? 0) + 1100, y: origin?.position.y ?? 0 }, { parent_id: origin?.parent_id });
         if (!target) throw new Error("无法创建结构节点");
         try {
           const document = await worldApi.getNodeDocument(target.id);
@@ -235,16 +253,21 @@ export function PluginSurface({ card, slot, level, children }: {
       state.selectCards([target.id], { syncCanvas: true });
     },
     clearOpenedFile: () => useOpenFiles.getState().clear(card.id),
-  }), [card.id, card.state_scope, source, updateCard, access, definition, sessionId, inWorkspace, navigation, executionSources]);
+  }), [card.id, card.state_scope, source, updateCard, access, stateless, configurablePersistence, credentialConfiguration, sessionId, viewKey, scopedView, inWorkspace, navigation, executionSources]);
   const reference = definition?.frontend?.[slot];
   if (covered && !inWorkspace && card.type.startsWith('xrd.')) return null;
   if (!reference || !definition) return <>{children}</>;
+  if (scopedView && !card.ephemeral && !workspace.value) return <p role={workspace.error ? 'alert' : 'status'}>{workspace.error ?? t('Loading workspace…')}
+    {workspace.error && <button className="secondary-button" onClick={workspace.reload}>{t('Retry')}</button>}</p>;
+  if (scopedView && workspace.value?.bound === false) return <p>{t('Select a connected Conversation session to use the current workspace.')}</p>;
   const View = definition.authoring && reference === 'oaw.authoring-card' ? AuthoringCardView
     : definition.traits.includes('ui.factory-card.v1') && reference === 'factory-card'
     ? PrintedCardView : pluginView(definition.plugin_id, reference, runtime);
-  return <PluginBoundary key={`${card.id}:${definition.plugin_id}:${runtime?.version}:${reference}:${card.state_scope}:${sessionId ?? ""}`}>
+  return <PluginBoundary key={`${card.id}:${definition.plugin_id}:${runtime?.version}:${reference}:${card.state_scope}:${viewKey ?? ""}`}>
     <Suspense fallback={<p role="status">{t("Loading Pack view...")}</p>}>
-      <View card={viewCard} definition={definition} level={level} host={host} />
+      <FileWorkspaceContext.Provider value={scopedView ? viewKey : undefined}>
+        <View card={viewCard} definition={definition} level={level} host={host} />
+      </FileWorkspaceContext.Provider>
     </Suspense>
   </PluginBoundary>;
 }

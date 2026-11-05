@@ -54,7 +54,7 @@ sys.modules['oaw_sandbox.linux_worker'].main(payload['request'],stdin_pending=bo
 # source change the next unrestricted transport helper.
 _WORKER_MODULES = tuple(
     (name, (Path(__file__).parent / f"{name}.py").read_text(encoding="utf-8"))
-    for name in ("models", "materialization", "base", "environment", "files", "transfers", "listing", "streaming", "mutations", "python_launchers", "python_runtime", "linux_network", "linux", "linux_worker")
+    for name in ("models", "resource_validation", "materialization", "base", "environment", "files", "workspace_access", "transfers", "listing", "streaming", "mutations", "python_launchers", "python_runtime", "linux_network", "linux", "linux_worker")
 )
 
 
@@ -102,6 +102,7 @@ class _Active:
 
 
 class WslSandboxBackend(SandboxBackend):
+    supports_workspace_scopes = True
     supports_invocation_environment = True
     supports_folder_mounts = True
     supports_execution_policy = True
@@ -352,9 +353,9 @@ class WslSandboxBackend(SandboxBackend):
 
     async def execute(self, sandbox_id: str, argv: Sequence[str], *,
         timeout_seconds: float | None = None, env: Mapping[str, str] | None = None,
-        invocation_env: Mapping[str, str] | None = None,
+        invocation_env: Mapping[str, object] | None = None,
         runtime_mount: RuntimeMount | None = None, execution_policy: Mapping[str, Any] | None = None,
-        folder_mounts: Sequence[FolderMount] = ()) -> CommandResult:
+        folder_mounts: Sequence[FolderMount] = (), working_directory: str = "", workspace_write_directory: str | None = None) -> CommandResult:
         from .models import execution_command_id
         from uuid import uuid4
         command_id = execution_command_id.get() or uuid4().hex
@@ -365,7 +366,13 @@ class WslSandboxBackend(SandboxBackend):
             active_process_limit=policy.get("active_process_limit", self._limits.active_process_limit),
             default_timeout_seconds=policy.get("command_timeout", self._limits.default_timeout_seconds))
         command = validate_argv(argv)
-        minimal_linux_environment(env, invocation_env=invocation_env)
+        # Host folder paths are converted by the Linux worker before applying
+        # operations. Preflight only the portable policy on the transport host.
+        from .environment import validate_command_environment
+        minimal_linux_environment(env)
+        values = validate_command_environment({} if invocation_env is None else invocation_env)
+        if {key.upper() for key in values} & {key.upper() for key in (env or {})}:
+            raise SandboxValidationError("Invocation environment conflicts with backend overrides")
         timeout = limits.default_timeout_seconds if timeout_seconds is None else float(timeout_seconds)
         if not math.isfinite(timeout) or timeout <= 0:
             raise SandboxValidationError("timeout_seconds must be finite and positive")
@@ -383,7 +390,7 @@ class WslSandboxBackend(SandboxBackend):
             raw = await self._request(self._payload("execute", sandbox_id, argv=list(command),
                 timeout_seconds=timeout, env=dict(env) if env is not None else None,
                 invocation_env=dict(invocation_env) if invocation_env is not None else None,
-                folder_mounts=[asdict(folder) for folder in folder_mounts],
+                folder_mounts=[asdict(folder) for folder in folder_mounts], working_directory=working_directory, workspace_write_directory=workspace_write_directory,
                 unit=active.unit, command_id=command_id, execution_policy=policy, runtime_mount=runtime_mount.to_wire() if runtime_mount is not None else None),
                 timeout=timeout + 20, active=active)
             result = CommandResult(sandbox_id=raw["sandbox_id"], argv=tuple(raw["argv"]),

@@ -22,6 +22,8 @@ export type { WorkspaceSectionProps } from "../workspace/WorkspaceSection";
 export { ApplicationSurface, WorkspacePanel, WorkspaceToolbar, WorkspaceEmptyState } from '../workspace/WorkspacePrimitives';
 export { IconButton } from '../components/IconButton';
 export { Modal } from '../components/Modal';
+export { Tooltip, Popover } from '../components/Floating';
+export type { TooltipProps, PopoverProps, FloatingPlacement } from '../components/Floating';
 export type { WorkspaceLayoutMetadata } from "../workspace/workspaceLayoutMetadata";
 export { useWorkspaceNavigation } from '../workspace/WorkspaceNavigation';
 export type { WorkspaceNavigation } from '../workspace/WorkspaceNavigation';
@@ -181,9 +183,17 @@ export interface PluginViewProps {
     /** Absent for state.mode=none. The host owns namespace and lifecycle. */
     state?: CardStateStore;
     /** Present only when the developer permits a choice; null restores its default. */
-    setDataPersistence?: (value: "shared" | "session" | null) => Promise<void>;
+    setDataPersistence?: (value: "shared" | "session" | "group" | null) => Promise<void>;
     /** Present only in a deployed Workspace. Reuse the view and hide engineering controls. */
     deployment?: import('../workspace/WorkspaceAccess').PluginDeploymentAccess;
+    /** Human configuration of this Environment/Sandbox card. Plugin API 1.42.
+     * Only configured flags are readable. null removes a binding; revision is
+     * from readDocument(). Absent in deployed Workspaces and on other card types.
+     * Never put secrets in config, documents, durable state or drafts. */
+    credentials?: {
+      status(): Promise<Record<string, boolean>>;
+      set(reference: string, value: string | null, expectedRevision: number): Promise<{ configured: boolean }>;
+    };
     getInputs?(nodeId?:string): Promise<{id:string;name:string;kind:string;ready:boolean;detail:string}[]>;
     ensureXrdInput?(kind:'pattern'|'library'): Promise<string>;
     startXrdWorkflow?(file:File): Promise<void>;
@@ -210,8 +220,8 @@ export interface PluginViewProps {
     documentDownloadUrl(name: string, nodeId?: string): string;
     /** Select a card and open its normal OAW workspace surface. */
     openWorkspace(nodeId: string): void;
-    /** Start an Agent through the ordinary OAW run lifecycle. */
-    runAgent(nodeId: string, prompt: string): Promise<void>;
+    /** Start an Agent through the ordinary OAW run lifecycle. `freshContext` runs it with no earlier history instead of the Agent's shared one. */
+    runAgent(nodeId: string, prompt: string, freshContext?: boolean): Promise<void>;
     /** Observe future node-document mutations received by the OAW event stream. */
     onDocumentChange(listener: (change: PluginDocumentChange) => void): () => void;
     /**

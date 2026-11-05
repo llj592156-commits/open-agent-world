@@ -2,11 +2,118 @@
 
 [API directory](../plugins.md) · [Card App tutorial](../developers/card-app.md)
 
+## Which version to declare
+
+| Version | Meaning |
+| --- | --- |
+| npm `@oaw/plugin-api` (currently 1.1.0 in this checkout) | Development package: build helpers and generated TypeScript declarations |
+| `PluginDescriptor.plugin_api_version` and `[compatibility].plugin_api` | Minimum host feature level used by the Pack; keep these declarations equal |
+| `FrontendPlugin.apiVersion` and `compatibility.frontend_api` (1) | Frontend module loading protocol, independent of host feature additions |
+| OAW release and `[compatibility].oaw` | Application release compatibility range |
+
+Using a newer SDK package does not upgrade the recipient's host. For example,
+an SDK 1.1.0 build using `host.credentials` needs Plugin API 1.42, while a build
+using only `Tooltip` needs 1.41. Optional features may be tested for availability;
+required features must be covered by the declared minimum. Generate/package the
+SDK from the host checkout you target; package versions do not imply an npm
+publication. Old Packs need no version change for host features they do not use.
+
 ## Minimum feature levels
 
 Use the minimum version required by every API your Pack calls. Older feature
 levels remain compatible unless the contract explicitly states otherwise. The
 following requirements are API facts, not desktop release availability.
+
+Plugin API 1.45 adds `RuntimeExecution.model_connection(reference)`, an async
+context manager accepting `oaw:default` or an `oaw:model:...` reference. It reuses
+the existing model settings and yields a `RuntimeModelConnection` whose base URL
+is private and whose API key is an execution-scoped token. The stored provider
+key remains in the host. Model, endpoint and credentials resolve together;
+disabled or changed connections fail explicitly. OpenAI and Anthropic compatible
+HTTP protocols are supported. Other adapters are rejected without falling back
+to another model. Closing either the context or execution revokes the connection.
+
+This uses the existing private forwarding transport with opt-in `path_prefix`
+and `stream` options. Registered destinations remain fixed; remote code cannot
+choose a host URL. Model streaming is incremental and bounded. Browser model
+selection reuses public `useModelOptions`; no credentials enter card settings.
+
+Acquire the model inside the existing execution context and keep both contexts
+open until the CLI finishes:
+
+```python
+async with capabilities.runtime_execution(agent_id, run_id, workspace=workspace, home=home) as execution:
+    async with execution.model_connection("oaw:default") as model:
+        # Adapt this CLI's own provider configuration to model.adapter,
+        # model.model_id and model.base_url. Only pass model.api_key as a
+        # child-process environment variable; it is a temporary proxy token.
+        process = await execution.spawn(argv, env={"HARNESS_MODEL_TOKEN": model.api_key or ""})
+        await process.wait()
+```
+
+This API provides protocol access, not a CLI's configuration format. The Pack
+maps the returned connection to that Harness's public provider configuration.
+Existing independent Harness settings remain available when the Pack does not
+request a model connection. OpenAI routes are `/v1/chat/completions` and
+`/v1/responses`; Anthropic routes are `/v1/messages` and
+`/v1/messages/count_tokens`, including the SDK's `beta=true` query and
+`anthropic-beta` header. Other routes, arbitrary queries and redirects are rejected.
+Credential rotation takes effect on the next request. A changed model or endpoint
+requires a new execution. No token or upstream error body belongs in UI or logs.
+
+Plugin API 1.44 adds host-selected `AgentCapabilityProvider.runtime_execution`
+and `NodeResourceContext.open_execution`, including duplex processes, bounded
+file transfer and private loopback tool forwarding. Native paths remain personal
+host paths; hosted compositions must explicitly supply an execution provider.
+Resource handlers may be async. Packs using this contract declare 1.44 in both
+their descriptor and manifest; they do not choose a cloud SDK or silently fall
+back to host execution.
+
+The execution session supplies `workspace`, `home`, `environment`, and an optional
+host-managed `command`. A CLI adapter uses `spawn(argv, env=...)`, the returned
+process's byte streams, `read_file` / `write_file`, and `forward_http` for a
+host-issued loopback tool endpoint. File transfers are bounded to 32 MiB and reuse
+the existing no-follow file policy. Local adapters may discover their existing
+CLI when `remote` is false; remote adapters must use a command configured inside
+that environment. Dependency declarations targeting `host-worker` still describe
+the host and are not implicitly installed in a remote environment.
+
+`runtime_execution_configuration(agent_id)` and a resource action's bound
+`execution_configuration()` read configuration without starting a process or
+allocating a cloud VM. Open sessions only for live Runs or explicit resource
+actions. The host tracks sessions through cancellation and shutdown; an
+unconfirmed cleanup keeps the node unavailable. Native execution preserves
+personal directories and is not an OS security sandbox. Remote providers own
+their isolation, credential filtering, persistent roots, durable allocation
+receipts, and confirmed teardown. The stdlib relay supports private process,
+file, and tool traffic over a provider-owned duplex transport without public
+callbacks. It does not provision a cloud environment by itself.
+
+Hosted runtimes declare `RuntimeProvider.supports_managed_execution = True` after
+adopting these execution APIs, using authorized Sandbox tools, or running a fixed
+Pack-owned pipeline in its declared managed environment. Fixed pipelines such as
+XRD remain host computations; this declaration does not move them into a remote
+Sandbox. General CLI Harness commands must use the host-selected execution API. The host
+rejects legacy adapters before Agent creation or execution; personal installations
+remain compatible. This declaration is a compatibility check for trusted code,
+not an OS boundary or a substitute for reviewing an installed backend Pack.
+
+Plugin API 1.43 provides `AgentCapabilityProvider.conversation_attachments`,
+`read_conversation_attachment` and `publish_conversation_attachment` for trusted
+runtime providers. They list sent files, read verified bytes and retain generated
+bytes in the current Run's Conversation session, with live session and graph
+authorization. See [runtime file transfer](plugin-capabilities.md#runtime-conversation-files-plugin-api-143).
+
+Plugin API 1.42 adds `NodePresentation.content_controls="side" | "bottom"` for
+`ui.content-surface.v1`, named host-worker environments through
+[`PluginContext.environment(name)`](plugin-lifecycle.md#declared-host-worker-environments),
+and the card-scoped human [`host.credentials`](plugin-frontend.md#human-credential-configuration)
+interface. These use existing host controls, environment providers and credential
+authorization; they introduce no alternate window, installer or secret store.
+
+Plugin API 1.41 provides shared frontend `Tooltip` and `Popover` components with
+theme tokens, top-layer positioning, viewport collision handling and keyboard
+dismissal. See [workspace design](../developers/workspace-design.md#tooltips-and-popovers-plugin-api-141).
 
 Plugin API 1.40 provides `CapabilityContext.read_artifact_file(capability, collection_id,
 version_id, path, max_bytes=...)` for trusted plugin handlers to consume an authorized

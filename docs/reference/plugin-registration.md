@@ -56,6 +56,10 @@ delete-transaction dependencies/recovery payloads; otherwise a plugin using only
 the original contracts can continue to declare `"1.0"`.
 Use `"1.2"` for documents and `"1.3"` for work-source execution or document
 reference remapping.
+Use `"1.41"` when importing `TEXT_EDITS_SCHEMA` from
+`open_agent_world.plugin_api.sandbox`. It shares the native exact-edit bounds;
+copy the schema before modifying a tool declaration. This helper grants no
+filesystem access and does not replace live capability checks.
 Use `"1.4"` for document seeds or document downloads. Use `"1.5"` for
 `NodeContainerDefinition`. The current skill toolbox helper requires `"1.10"`.
 Use `"1.10"` for `CapabilityDefinition`, `CapabilitySelector`, and operation tools
@@ -279,6 +283,10 @@ Legacy `surfaces` declarations remain supported: `node` is implicit, `preview`
 is the initial state when available, and opening prefers `inspector`, then
 `workspace`, then `preview`. An explicit `presentation` takes precedence;
 the catalog also derives the legacy `surfaces` flags from it for older clients.
+New plugins should declare `presentation` alone, without repeating `surfaces`.
+For `ui.content-surface.v1`, Plugin API 1.42 also accepts
+`content_controls="bottom"` (default `"side"`); the host owns its reserved edge,
+drag grip and actions. See [workspace design](../developers/workspace-design.md).
 The definition controls generic card surfaces; specialized container views still
 own their member layout. Frontend content uses the existing `preview`, `body`
 (inspector), and `workspace` slots.

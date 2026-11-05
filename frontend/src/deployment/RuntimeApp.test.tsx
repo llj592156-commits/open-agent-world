@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import * as hostedAuth from '../auth/hostedSession';
 import { deploymentRequest } from './api';
@@ -17,11 +17,13 @@ it('keeps edits made while a workspace refresh is in flight', async () => {
     config: { library_engine: 'qualx' } }], legion: { id: 'workspace', type: 'legion' }, catalog: TEST_CATALOG, permissions: {} };
   let refresh!: (value: typeof workspace) => void;
   let poll!: () => void;
-  vi.spyOn(window, 'setInterval').mockImplementation(callback => { poll = callback as () => void; return 1; });
+  vi.spyOn(window, 'setInterval').mockImplementation((callback, delay) => { if (delay === 3000) poll = callback as () => void; return 1; });
   vi.mocked(deploymentRequest).mockResolvedValueOnce(workspace).mockImplementationOnce(() => new Promise(resolve => { refresh = resolve; }));
   render(<RuntimeApp name="Research" />);
   await screen.findByRole('region', { name: 'Published workspace' });
+  await waitFor(() => expect(poll).toEqual(expect.any(Function)));
   act(() => poll());
+  await waitFor(() => expect(refresh).toEqual(expect.any(Function)));
   act(() => useWorldStore.setState(state => ({ cards: state.cards.map(card => card.id === 'match'
     ? { ...card, revision: 5, config: { library_engine: 'native' } } : card) })));
   await act(async () => { refresh(workspace); });

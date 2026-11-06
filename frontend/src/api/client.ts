@@ -1,4 +1,4 @@
-import { cardStateSession, stateSessionHeaders } from "../state/cardState";
+import { cardStateSession, viewingSession, stateSessionHeaders } from "../state/cardState";
 import type { BackgroundJob, JobAction, JobsSnapshot } from '../cards/jobTypes';
 import { normalizeCardFinish } from '../cards/cardFinish';
 import { fetchWithRetry } from './fetchWithRetry';
@@ -308,6 +308,12 @@ function unwrap<T>(input: unknown, key: string): T {
 }
 
 export const worldApi = {
+  fileTransferPolicy(): Promise<{ max_file_bytes: number; chunk_bytes: number }> {
+    return request('/files/policy');
+  },
+  restartApplication(): Promise<{ instance_id: string }> {
+    return request('/application/restart', { method: 'POST', headers: { 'X-OAW-Restart': '1' } });
+  },
   listPackProjects(): Promise<import('../factory/projectTypes').ProjectList> {
     return request('/packs/projects', { headers: { 'X-OAW-Pack-Install': '1' } });
   },
@@ -440,6 +446,10 @@ export const worldApi = {
     return request<SandboxSettings>("/settings/sandbox");
   },
 
+  getEnvironmentContext(id: string): Promise<Record<string, string>> {
+    return request(`/nodes/${encodeURIComponent(id)}/environment-context`);
+  },
+
   saveSandboxSettings(settings: SandboxSettings & { secrets?: Record<string, string>; folders?: Record<string, EnvironmentFolderBinding> }): Promise<SandboxSettings> {
     return request<SandboxSettings>("/settings/sandbox", {
       method: "PUT", body: JSON.stringify({
@@ -475,6 +485,21 @@ export const worldApi = {
   async nodeResourceAction(id: string, action: string, args: Record<string, unknown>, confirm = false, sessionId: string | null = cardStateSession(id) ?? null): Promise<Record<string, unknown>> {
     return request(`/nodes/${encodeURIComponent(id)}/resource/${encodeURIComponent(action)}`, {
       method: "POST", headers: stateSessionHeaders(sessionId), body: JSON.stringify({ arguments: args, confirm }),
+    });
+  },
+
+  async nodeResourceFileAction(id: string, action: string, args: Record<string, unknown>, files: Record<string, File>, confirm = false, sessionId: string | null = cardStateSession(id) ?? null): Promise<Record<string, unknown>> {
+    const policy = await worldApi.fileTransferPolicy();
+    const body = new FormData();
+    body.append('request', JSON.stringify({ arguments: args, confirm }));
+    let total = 0;
+    for (const [key, file] of Object.entries(files)) {
+      total += file.size;
+      if (total > policy.max_file_bytes) throw new Error(`Upload exceeds ${policy.max_file_bytes / 1024 / 1024} MiB: ${file.name}`);
+      body.append(key, file, file.name);
+    }
+    return request(`/nodes/${encodeURIComponent(id)}/resource/${encodeURIComponent(action)}/files`, {
+      method: 'POST', headers: stateSessionHeaders(sessionId), body,
     });
   },
 
@@ -811,7 +836,7 @@ export const worldApi = {
 
   runAgent(nodeId: string, prompt: string, freshContext = false): Promise<AgentRunReceipt> {
     return request<AgentRunReceipt>(`/agents/${encodeURIComponent(nodeId)}/run`, {
-      method: "POST",
+      method: "POST", headers: stateSessionHeaders(viewingSession(nodeId) ?? 'default'),
       body: JSON.stringify({ prompt, ...(freshContext ? { fresh_context: true } : {}) }),
     });
   },
@@ -968,7 +993,7 @@ export const worldApi = {
   postConversationMessage(
     conversationId: string,
     sessionId: string,
-    input: { content: string; mention_agent_ids: string[]; message_id?: string; attachments?: { version_id: string; path: string }[] },
+    input: { content: string; mention_agent_ids: string[]; message_id?: string; continuation_run_id?: string; attachments?: { version_id: string; path: string }[] },
   ): Promise<{ message: ConversationMessage; accepted_agent_ids: string[] }> {
     return request(`/conversations/${encodeURIComponent(conversationId)}/sessions/${encodeURIComponent(sessionId)}/messages`, {
       method: "POST",
@@ -1019,16 +1044,20 @@ export const worldApi = {
     return request<SandboxRuntimeCatalog>(`/sandbox/runtimes${refresh ? "?refresh=true" : ""}`);
   },
 
+  workspaceContext(nodeId: string, sessionId?: string): Promise<import('../state/workspaceContext').WorkspaceContext> {
+    return request(`/nodes/${encodeURIComponent(nodeId)}/workspace-context`, { headers: stateSessionHeaders(sessionId ?? 'default') });
+  },
+
   sandboxWorkspace<T = Record<string, unknown>>(nodeId: string, action: string, body?: unknown): Promise<T> {
-    return request<T>(`/sandboxes/${encodeURIComponent(nodeId)}/${action}`, body === undefined ? undefined : { method: "POST", body: JSON.stringify(body) });
+    return request<T>(`/sandboxes/${encodeURIComponent(nodeId)}/${action}`, { headers: stateSessionHeaders(viewingSession(nodeId) ?? 'default'), ...(body === undefined ? {} : { method: "POST", body: JSON.stringify(body) }) });
   },
 
   deleteSandboxFile(nodeId: string, path: string): Promise<{ deleted: string }> {
-    return request(`/sandboxes/${encodeURIComponent(nodeId)}/files?${new URLSearchParams({ path })}`, { method: 'DELETE' });
+    return request(`/sandboxes/${encodeURIComponent(nodeId)}/files?${new URLSearchParams({ path })}`, { method: 'DELETE', headers: stateSessionHeaders(viewingSession(nodeId) ?? 'default') });
   },
 
   moveSandboxFile(nodeId: string, path: string, destination: string): Promise<{ moved: string; destination: string }> {
-    return request(`/sandboxes/${encodeURIComponent(nodeId)}/files/move`, { method: 'POST', body: JSON.stringify({ path, destination }) });
+    return request(`/sandboxes/${encodeURIComponent(nodeId)}/files/move`, { method: 'POST', headers: stateSessionHeaders(viewingSession(nodeId) ?? 'default'), body: JSON.stringify({ path, destination }) });
   },
 
   async downloadSandboxFile(nodeId: string, root: string, path: string, options?: import('../files/transferQueue').TransferOptions): Promise<Blob> {
@@ -1046,8 +1075,8 @@ export const worldApi = {
     return response.blob();
   },
 
-  uploadSandboxEntry(nodeId: string, path: string, file?: File, options?: import('../files/transferQueue').TransferOptions): Promise<{ written?: number; created?: boolean }> {
-    const route = `/sandboxes/${encodeURIComponent(nodeId)}/files?${new URLSearchParams({ path, directory: String(!file) })}`;
+  uploadSandboxEntry(nodeId: string, path: string, file?: File, options?: import('../files/transferQueue').TransferOptions): Promise<{ written?: number; created?: boolean; path?: string }> {
+    const route = `/sandboxes/${encodeURIComponent(nodeId)}/files?${new URLSearchParams({ path, directory: String(!file), state_session: viewingSession(nodeId) ?? 'default' })}`;
     if (options) return transferRequest(route, file ?? new Blob(), options);
     return request(route, {
       method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file ?? '',
@@ -1070,10 +1099,11 @@ export const worldApi = {
     });
   },
 
-  executeSandbox(nodeId: string, command: string, pythonEnvironment: "auto" | "managed" = "auto"): Promise<Record<string, unknown>> {
+  executeSandbox(nodeId: string, command: string, pythonEnvironment: "auto" | "managed" = "auto", workingDirectory = ""): Promise<Record<string, unknown>> {
     return request<Record<string, unknown>>(`/sandboxes/${encodeURIComponent(nodeId)}/execute`, {
+      headers: stateSessionHeaders(viewingSession(nodeId) ?? 'default'),
       method: "POST",
-      body: JSON.stringify({ command, ...(pythonEnvironment === "managed" ? { python_environment: "managed" } : {}) }),
+      body: JSON.stringify({ command, ...(pythonEnvironment === "managed" ? { python_environment: "managed" } : {}), ...(workingDirectory ? { working_directory: workingDirectory } : {}) }),
     });
   },
 };
@@ -1083,7 +1113,7 @@ export interface EnvironmentFolderBinding { path: string; access: "read_only" | 
 export interface SandboxSettings {
   workspace_root: string | null;
   runtime: string;
-  environment_variables?: Record<string, string | { secret_ref: string } | { folder_ref: string } | { file_ref: string } | { path_ref: string }>;
+  environment_variables?: Record<string, string | (({ value: string } | { secret_ref: string } | { folder_ref: string } | { file_ref: string } | { path_ref: string }) & { operation?: "replace" | "append" | "prepend"; separator?: string })>;
   secret_bindings?: Record<string, boolean>;
   folder_bindings?: Record<string, EnvironmentFolderBinding>;
   backup_paths?: string[];

@@ -97,8 +97,9 @@ the receipt does not grant observation access or subscribe a plugin backend.
 This exposes the backend's existing admission response; it does not add a new
 launch endpoint or wait for a final result. The existing optional `freshContext`
 argument is preserved: `true` uses a new context without earlier history;
-omitting it or passing `false` retains the Agent's shared default context.
-Since Plugin API 1.43, plugin callers
+omitting it or passing `false` retains the host's normal session-context selection.
+The launch request preserves the host-selected state-session header.
+Since Plugin API 1.48, plugin callers
 must handle rejected launch promises themselves. The native Agent button keeps
 its existing error toast; the plugin path does not add that native-button toast.
 Calls that simply await and ignore a successful return can keep doing so.

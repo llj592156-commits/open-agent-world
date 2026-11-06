@@ -213,15 +213,16 @@ recovery guarantees. Ordinary document `artifacts` metadata does not grant acces
 or retain file bytes.
 
 
-### Trusted Run identity (API 1.43)
+### Trusted Run identity (API 1.48)
 
 `NodeResourceContext.run_id` is an optional, host-supplied Run identity for the
 current Agent capability invocation. It is populated only when the active Run
 belongs to the calling Agent; desktop calls and capability calls outside a Run
 receive `None`. A tool argument named `run_id` cannot override this field.
-The field is appended with a default of `None`, preserving existing positional
-constructors, including the existing eighth `resolve_model` argument. The host
-reads the active invocation before dispatching the synchronous resource handler
-to its worker; concurrent Runs receive their own identities. It identifies the
+The field is appended after `files` with a default of `None`, preserving existing
+positional constructors, including `resolve_model`, `open_execution`,
+`execution_configuration` and the eleventh `files` argument. The host
+reads the active invocation before dispatching a synchronous or asynchronous
+resource handler; concurrent Runs receive their own identities. It identifies the
 invocation only; it does not subscribe to Run
 events, query execution status, or change a plugin's business task.

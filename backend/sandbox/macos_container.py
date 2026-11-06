@@ -31,6 +31,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .base import SandboxBackend, SandboxEventSink
+from .resource_validation import validate_resource_source
 from .materialization import RuntimeMount, materialize_bundle, cleanup_materializations
 from .models import (
     CommandResult, ResourceAccess, ResourceAttachment, SandboxEvent,
@@ -160,7 +161,7 @@ def validate_relative_path(raw: str) -> str:
 
 
 def minimal_container_environment(extra: Mapping[str, str] | None = None, *,
-    invocation_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    invocation_env: Mapping[str, object] | None = None) -> dict[str, str]:
     from .environment import validate_command_environment, apply_invocation_environment
     environment = {
         "PATH": "/sandbox/home/.local/bin:/sandbox/home/bin:/usr/local/bin:/usr/bin:/bin",
@@ -173,7 +174,7 @@ def minimal_container_environment(extra: Mapping[str, str] | None = None, *,
         if not isinstance(extra, Mapping):
             raise SandboxValidationError("env must be an object")
         for key, value in extra.items():
-            if key not in {"LANG", "LC_ALL", "TZ", "TERM"}:
+            if key not in {"LANG", "LC_ALL", "TZ", "TERM"} or not isinstance(value, str):
                 raise SandboxValidationError(f"environment key is outside the allowlist: {key}")
             validate_command_environment({key: value})
             environment[key] = value
@@ -359,6 +360,7 @@ class MacosContainerSandboxBackend(SandboxBackend):
     intentionally no subprocess or path-only fallback.
     """
 
+    supports_workspace_scopes = True
     supports_invocation_environment = True
     supports_execution_policy = True
 
@@ -515,9 +517,10 @@ class MacosContainerSandboxBackend(SandboxBackend):
     async def _execute_record(
         self, owner: _Record, execution: _Execution, sandbox_id: str, argv: Sequence[str], *,
         timeout_seconds: float | None = None, env: Mapping[str, str] | None = None,
-        invocation_env: Mapping[str, str] | None = None,
+        invocation_env: Mapping[str, object] | None = None,
         runtime_mount: RuntimeMount | None = None,
         execution_policy: Mapping[str, Any] | None = None,
+        working_directory: str = "", workspace_write_directory: str | None = None,
     ) -> CommandResult:
         policy = execution_policy or {}
         if type(policy.get("network_enabled", False)) is not bool:
@@ -562,15 +565,17 @@ class MacosContainerSandboxBackend(SandboxBackend):
 
         container_id = self._execution_container_id(sandbox_id, execution.command_id)
         execution.container_id = container_id
+        from .files import working_path, command_path
+        working_path(owner.host_workspace, working_directory)
         container_argv = self._container_command(
             owner, mount, limits, container_id=container_id,
-            network_settings=network_settings)
+            network_settings=network_settings, workspace_write_directory=workspace_write_directory)
         request = json.dumps({
             "operation": "execute",
             "argv": list(command),
             "environment": environment,
             "timeout_seconds": timeout,
-            "cwd": "/workspace",
+            "cwd": command_path(working_directory),
         }, ensure_ascii=True).encode() + b"\n"
 
         started = time.monotonic()
@@ -651,7 +656,7 @@ class MacosContainerSandboxBackend(SandboxBackend):
     def _container_command(
         self, record: _Record, runtime_mount: tuple[Path, str] | None,
         limits: SandboxLimits, *, container_id: str | None = None,
-        network_settings: str | None = None,
+        network_settings: str | None = None, workspace_write_directory: str | None = None,
     ) -> list[str]:
         uid, gid = _host_identity()
         result = [
@@ -667,12 +672,17 @@ class MacosContainerSandboxBackend(SandboxBackend):
             "--cap-drop", "ALL",
             "--read-only", "--tmpfs", "/tmp",
             "--volume", (f"{record.host_workspace}:/workspace:ro"
-                if record.workspace_access == ResourceAccess.READ_ONLY
+                if record.workspace_access == ResourceAccess.READ_ONLY or workspace_write_directory is not None
                 else f"{record.host_workspace}:/workspace"),
             "--volume", f"{record.root / 'home'}:/sandbox/home",
             "--volume", f"{self.python_runtime.root}:{_PYTHON_RUNTIME_TARGET}:ro",
             "--workdir", "/workspace",
         ]
+        from .workspace_access import writable_path, mount_access
+        from .files import command_path
+        if workspace_write_directory and record.workspace_access != ResourceAccess.READ_ONLY:
+            writable = writable_path(record.host_workspace, workspace_write_directory)
+            result.extend(['--volume', f'{writable}:{command_path(workspace_write_directory)}'])
         if network_settings is not None:
             from .linux_network import PUBLIC_RESOLVERS
             # These are granted only to the trusted bootstrap. It installs
@@ -686,7 +696,7 @@ class MacosContainerSandboxBackend(SandboxBackend):
             result[3:3] = ["--name", container_id]
         for attachment in record.attachments.values():
             target = f"/sandbox/{attachment.relative_path}"
-            suffix = ":ro" if attachment.access == ResourceAccess.READ_ONLY else ""
+            suffix = ":ro" if mount_access(record.host_workspace, attachment.source, attachment.access, workspace_write_directory) == ResourceAccess.READ_ONLY else ""
             result.extend(["--volume", f"{attachment.source}:{target}{suffix}"])
         if runtime_mount is not None:
             source, key = runtime_mount
@@ -933,18 +943,7 @@ class MacosContainerSandboxBackend(SandboxBackend):
         return str(resolved)
 
     def _validate_source(self, source: Path, *, must_exist: bool = True) -> Path:
-        if source.is_symlink():
-            raise SandboxValidationError("resource symlinks are not allowed")
-        try:
-            resolved = source.resolve(strict=must_exist)
-        except OSError as exc:
-            raise SandboxValidationError("managed resource does not exist") from exc
-        self._assert_within(resolved, self._managed_root)
-        if (any(resolved.is_relative_to(self._managed_root / name)
-                for name in ("sandbox-runtimes", "sandboxes", "sandbox-bindings", "runtime"))
-                or (must_exist and not resolved.is_file())):
-            raise SandboxValidationError("only regular managed resource files can be attached")
-        return resolved
+        return validate_resource_source(source, self._managed_root, must_exist=must_exist)
 
     def _validate_record_paths(self, record: _Record) -> None:
         self._assert_within(record.root.resolve(), self._root)

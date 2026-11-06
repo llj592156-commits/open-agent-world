@@ -19,6 +19,8 @@ from backend.spatial import Rectangle
 if TYPE_CHECKING:
     from backend.skill_runtime import RunSkillScript
     from backend.canvas_control import CanvasControl, CanvasScope
+    from backend.security.environment_source import ExecutionEnvironmentSource
+    from backend.agents.execution import RuntimeExecutionProvider, RuntimeExecutionBroker
 
 from backend.agents import (
     AgentNotFoundError,
@@ -60,7 +62,7 @@ from backend.events.hub import EventHub
 from backend.events.models import EventType, RuntimeEvent
 from backend.persistence.database import Database
 from backend.idempotency import IdempotencyStore
-from backend.request_context import RequestContext
+from backend.request_context import LOCAL_TENANT, RequestContext
 from backend.legions import (
     LegionBlueprint,
     LegionBounds,
@@ -105,7 +107,6 @@ from backend.sandbox import (
     SandboxBackend,
     SandboxEvent,
     SandboxEventType,
-    SandboxError,
     SandboxNotFoundError,
     SandboxStateError,
     SandboxValidationError,
@@ -568,12 +569,14 @@ class ApplicationServices:
     card_state: object = None
     node_execution: NodeExecutionService | None = None
     sandbox_operations: Any = None
+    runtime_execution: RuntimeExecutionBroker | None = field(default=None, repr=False)
     background_jobs: Any = None
     summoning: SummoningService | None = None
     sandbox_backend: SandboxBackend | None = None
     plugin_bootstrap: Any = None
     pack_installations: Any = None
     marketplace: Any = None
+    execution_environment_source: ExecutionEnvironmentSource | None = field(default=None, repr=False)
     _node_mutation_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, init=False, repr=False
     )
@@ -873,6 +876,8 @@ class ApplicationServices:
                 timeout_seconds=self._lifecycle_cleanup_timeout_seconds))
         self._restored_lifecycles.clear()
         await drain(self._require_run_manager().shutdown())
+        if self.runtime_execution is not None:
+            await drain(self.runtime_execution.shutdown())
         if self.node_execution.continuation_outputs:
             await asyncio.gather(*tuple(self.node_execution.continuation_outputs), return_exceptions=True)
         if failures:
@@ -1108,7 +1113,10 @@ class ApplicationServices:
             )
             try:
                 await transaction.commit()
-                card = self.enrich_card(self.world.update_card(card_id, request))
+                with self.database.transaction(immediate=True):
+                    from backend.workspace_context import preserve_sessions_on_change
+                    preserve_sessions_on_change(self, current, updated)
+                    card = self.enrich_card(self.world.update_card(card_id, request))
             except BaseException as error:
                 rollback_error = await self._rollback_lifecycle(transaction, error)
                 if rollback_error is not None:
@@ -1176,12 +1184,11 @@ class ApplicationServices:
                 for _, transaction in prepared:
                     attempted.append(transaction)
                     await transaction.commit()
-                cards = [
-                    self.enrich_card(card)
-                    for card in self.world.update_cards(
-                        [item for item, _ in prepared]
-                    )
-                ]
+                with self.database.transaction(immediate=True):
+                    from backend.workspace_context import preserve_sessions_on_change
+                    for item, _ in prepared:
+                        preserve_sessions_on_change(self, previous_cards[item.node_id], self.world.preview_update_card(item.node_id, item.patch))
+                    cards = [self.enrich_card(card) for card in self.world.update_cards([item for item, _ in prepared])]
             except BaseException as error:
                 for transaction in reversed(attempted):
                     rollback_error = await self._rollback_lifecycle(transaction, error)
@@ -2180,14 +2187,28 @@ class ApplicationServices:
                     from backend.legions.runtime import LegionStateWrite, write_shared_state
                     write_shared_state(self.world, self.state, node_ids[node.key],
                                        LegionStateWrite(value=node.initial_shared_state, expected_revision=0))
-            for node in scoped_document_seeds:
+            def seed_scoped_document(node):
                 from backend.node_documents import read_document, write_document
                 new_id = node_ids[node.key]
                 spec = self.plugins.node_type(node.type).document
                 kind = self.world.get_card(new_id).state_scope
-                identity = (kind, self.card_state.default_session(new_id) if kind == "session" else "*")
+                session = self.card_state.default_session(new_id)
+                state_policy = self.plugins.node_type(node.type).state
+                if getattr(state_policy, 'follow_workspace', False):
+                    from backend.workspace_context import resolve_workspace
+                    workspace = resolve_workspace(self, new_id, session_id=session)
+                    identity = workspace['scope_type'], workspace['scope_id']
+                elif kind == 'group':
+                    with self.database.locked() as db:
+                        row = db.execute('SELECT group_id FROM conversation_sessions WHERE id=?', (session,)).fetchone()
+                    identity = kind, row['group_id'] if row else session
+                else:
+                    identity = kind, session if kind == 'session' else '*'
                 revision = read_document(self, new_id, state_identity=identity)["revision"]
                 write_document(self, new_id, spec.remap_references(node.initial_document, node_ids), revision, state_identity=identity)
+            for node in scoped_document_seeds:
+                if not getattr(self.plugins.node_type(node.type).state, 'follow_workspace', False):
+                    seed_scoped_document(node)
             from backend.plugin_defaults import restore_metadata, ensure_equipment, adopt_equipment
             with self.events.committed_batch(), self.database.transaction(immediate=True):
                 for node in template_nodes:
@@ -2217,6 +2238,9 @@ class ApplicationServices:
                     target=external.id if binding["internal_is_source"] else internal,
                     relationship=binding["relationship"], direction=binding["direction"],
                 ), _publish_event=False))
+            for node in scoped_document_seeds:
+                if getattr(self.plugins.node_type(node.type).state, 'follow_workspace', False):
+                    seed_scoped_document(node)
         except BaseException as error:
             cleanup_errors = await self._compensate_legion_instance(
                 created_nodes, created_edges, creation_receipts, error
@@ -2525,9 +2549,17 @@ class ApplicationServices:
         await self._publish_resource_modified(document, agent_id=agent_id, operation="patch")
         return document
 
-    async def run_agent(self, agent_id: str, prompt: str, *, context_id: str | None = None) -> dict[str, Any]:
+    async def run_agent(self, agent_id: str, prompt: str, *, context_id: str | None = None,
+                        task_id: str | None = None, parent_run_id: str | None = None,
+                        detached: bool = False) -> dict[str, Any]:
         self._require_agent(agent_id)
-        run = await self._require_run_manager().start_run(agent_id, prompt, context_id=context_id)
+        from backend.card_state import active_state_session, DEFAULT_SESSION
+        from backend.workspace_context import session_context
+        if context_id is None:
+            selected = session_context(self, agent_id)['id'] if active_state_session.get() is not None else None
+            context_id = selected if selected != DEFAULT_SESSION else None
+        run = await self._require_run_manager().start_run(agent_id, prompt, context_id=context_id,
+            task_id=task_id, parent_run_id=parent_run_id, detached=detached)
         return {"accepted": True, "agent_id": agent_id, "run_id": run.run_id}
 
     def conversation_summary(self, conversation_id: str) -> ConversationSummary:
@@ -2739,6 +2771,13 @@ class ApplicationServices:
             self._require_session_participant(session, agent_id)
             self._require_conversation_connection(agent_id, conversation_id)
 
+        if request.continuation_run_id is not None:
+            from backend.conversations.continuation import require_source, original_task
+            source = require_source(self, str(request.continuation_run_id), conversation_id, session_id)
+            original_task(self, source.run_id, conversation_id, session_id)
+            if mentions != [source.agent_id]:
+                raise ConversationValidationError("Continue with the original Agent only")
+
         # Persistence is deliberately independent from Run admission. A busy
         # Agent must never make the user's message disappear or fail to send.
         message = self.conversations.add_message(
@@ -2752,6 +2791,7 @@ class ApplicationServices:
             mention_agent_ids=mentions,
             attachments=attachments,
             delivery_agent_ids=mentions,
+            continuation_run_id=str(request.continuation_run_id) if request.continuation_run_id else None,
         )
         await self._publish_conversation_message(message)
 
@@ -2779,11 +2819,18 @@ class ApplicationServices:
     def _conversation_delivery_task(self, message_ids: list[str]) -> str:
         messages = [self.conversations.get_message(message_id) for message_id in message_ids]
         if len(messages) == 1:
-            latest = messages[0].content
+            message = messages[0]
+            if message.continuation_run_id:
+                from backend.conversations.continuation import original_task
+                return original_task(self, message.continuation_run_id, message.conversation_id, message.session_id)
+            latest = message.content
         else:
             chunks = []
             for index, message in enumerate(messages, start=1):
                 text = message.content
+                if message.continuation_run_id:
+                    from backend.conversations.continuation import original_task
+                    text = original_task(self, message.continuation_run_id, message.conversation_id, message.session_id) + "\nContinuation request: " + text
                 for attachment in message.attachments:
                     text += (
                         f"\n[Attachment: {attachment.name}; version_id={attachment.version_id}; "
@@ -2863,10 +2910,14 @@ class ApplicationServices:
             )
             if not claimed:
                 return
-            prompt = self._conversation_delivery_prompt(
-                conversation_id, session, agent_id, claimed, max_sequence
-            )
             try:
+                prompt = self._conversation_delivery_prompt(
+                    conversation_id, session, agent_id, claimed, max_sequence
+                )
+                from backend.conversations.continuation import recovery_context
+                continuation = await recovery_context(self, claimed, agent_id)
+                if continuation.text:
+                    prompt += "\n\n" + continuation.text
                 run = await manager.start_run(
                     agent_id,
                     prompt,
@@ -2878,6 +2929,7 @@ class ApplicationServices:
                     initial_lifecycle={
                         "delivery_message_ids": claimed,
                         "conversation_max_sequence": max_sequence,
+                        "continuation_run_id": continuation.source_run_id,
                     },
                 )
             except Exception:
@@ -3065,6 +3117,10 @@ class ApplicationServices:
             prompt,
             caller_kind="agent",
             caller_id=source_agent_id,
+            # A private message delegates only this prompt. Keep Run ancestry
+            # for cancellation and tracing without inheriting a chat's history,
+            # inbox, files or persisted model checkpoint.
+            context_id="communicate:" + uuid4().hex,
         )
         await self._await_synchronous_turn(manager, run.run_id, target.name)
         final_text = manager.final_text(run.run_id)
@@ -3171,252 +3227,16 @@ class ApplicationServices:
         environment_id: str | None = None,
         target_id: str | None = None,
         python_environment: str = "auto",
+        _working_directory: str | None = None,
     ) -> CommandResult:
-        if not isinstance(python_environment, str) or python_environment not in {"auto", "managed", "none"}:
-            raise SandboxValidationError("python_environment must be auto, managed, or none")
-        if timeout_seconds is not None:
-            import math
-            if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 36000:
-                raise SandboxValidationError("timeout_seconds must be finite and between 0 (exclusive) and 36000 seconds")
-        async with self._portable_state_gate.execution():
-            # Validate graph authority against a complete formation, but do
-            # not hold the graph barrier while an arbitrary command runs.
-            async with self._node_mutation():
-                self._require_card_type(sandbox_id, CardType.SANDBOX)
-                if agent_id is not None:
-                    self.capabilities.require_sandbox_execute(agent_id, sandbox_id)
-            backend = self._require_sandbox_backend()
-            if (argv is None) == (command is None):
-                raise SandboxValidationError("provide exactly one of command or argv")
-            from backend.sandbox.commands import needs_managed_python, require_noninteractive
-            require_noninteractive(argv if _skill_request is None else None, command)
-            await self.ensure_sandbox_running(sandbox_id, agent_id=agent_id)
-            if command is not None:
-                info = await backend.get(sandbox_id)
-                if not info.shell:
-                    raise SandboxStateError("No execution shell is available for this Sandbox")
-                argv = [*info.shell, command]
-            assert argv is not None
-            async def execute_and_refresh() -> CommandResult:
-                secret_token = None
-                receipt = None
-                from backend.sandbox.models import execution_command_id
-                command_id = _operation_id or uuid4().hex
-                command_token = execution_command_id.set(command_id)
-                try:
-                    execution_argv = argv
-                    options = {}
-                    if getattr(backend, "supports_execution_policy", False):
-                        config = self.world.get_card(sandbox_id).config
-                        options["execution_policy"] = {key: config[key] for key in ("network_enabled", "memory_bytes", "active_process_limit", "command_timeout") if key in config}
-                    # Re-check after scheduling, immediately before dispatch.
-                    async with self._node_mutation():
-                        if agent_id is not None:
-                            from backend.capabilities.projection import authorize_invocation
-                            values = {key: value for key, value in {"environment_id": environment_id, "target_id": target_id}.items() if value is not None}
-                            kind = "sandbox.execute"
-                            if _skill_request is not None:
-                                values["skill_id"] = _skill_request.skill_id
-                                kind = "sandbox.run_skill_script"
-                            authorize_invocation(self, agent_id, f"{kind}:{sandbox_id}", values)
+        from backend.sandbox.execution import execute_sandbox
 
-                        from backend.sandbox.pack_profiles import execution_profile_references, bind_command_profiles
-                        runtime_requirements = execution_profile_references(self, agent_id, sandbox_id,
-                            background_job_id=_background_job_id)
-                        if _skill_request is not None:
-                            from backend.skill_runtime import resolve_skill_mount
-                            if agent_id is None:
-                                raise ResourceValidationError("Skill execution requires an Agent")
-                            execution_argv, mount = resolve_skill_mount(self, agent_id, sandbox_id, _skill_request,
-                                                                      runtime_requirements=runtime_requirements)
-                            options["runtime_mount"] = mount
-                        elif runtime_requirements:
-                            execution_argv, mount = bind_command_profiles(self.plugins, runtime_requirements, execution_argv)
-                            options['runtime_mount'] = mount
-                        if python_environment == 'none' and execution_argv[:4] == ['python3', '-I', '-S', '_oaw_profile/runner.py']:
-                            raise SandboxValidationError('Declared Pack environments require Sandbox Python; use auto or managed')
-                        if getattr(backend, "supports_optional_python_runtime", False):
-                            if isinstance(backend, SandboxManager):
-                                options["python_environment"] = python_environment
-                            else:
-                                options["managed_python"] = needs_managed_python(execution_argv,
-                                    python_environment, skill=_skill_request is not None)
-                        elif python_environment == "none":
-                            raise SandboxValidationError(
-                                "This Sandbox runtime cannot omit its managed Python environment")
-                        from backend.execution_config import resolve_sandbox_configuration
-                        from backend.execution_config import effective_variables
-                        _, pending_variables = effective_variables(self, sandbox_id, environment_id)
-                        if (pending_variables or target_id or environment_id) and not backend.supports_invocation_environment:
-                            raise SandboxValidationError("This Sandbox backend does not support invocation configuration")
-                        folder_mounts = []
-                        injected, secrets = resolve_sandbox_configuration(self, sandbox_id, environment_id, target_id, folder_mounts=folder_mounts)
-                        if folder_mounts:
-                            if not backend.supports_folder_mounts:
-                                raise SandboxValidationError("This Sandbox runtime does not support folder variables")
-                            options["folder_mounts"] = tuple(folder_mounts)
-                        if injected:
-                            if not backend.supports_invocation_environment:
-                                raise SandboxValidationError("This Sandbox backend does not support invocation configuration")
-                            options["invocation_env"] = injected
-                            secret_token = self._execution_secrets.set(secrets)
-                        self.resources.artifacts.assert_source_idle(sandbox_id)
-                        self.summoning.assert_admission(sandbox_id)
-                        if sandbox_id in self._sandbox_stopping:
-                            raise SandboxStateError('Sandbox admission is closed while termination cleanup is pending')
-                        self._require_card_type(sandbox_id, CardType.SANDBOX)
-                        from backend.sandbox.history import save, key as command_history_key
-                        from backend.security.redaction import redact
-                        # Build the complete journal entry before exposing it.
-                        # A validation error here must not persist a half-filled
-                        # receipt that later crashes Sandbox history rendering.
-                        receipt_data = {"id": command_id, "caller": agent_id or "user", "state": "running",
-                            "sandbox_id": sandbox_id,
-                            "python_environment": python_environment,
-                            "history_key": command_history_key(self, sandbox_id),
-                            "run_id": self.run_manager.current_context.run_id if self.run_manager.current_context else None,
-                            "started_at": datetime.now(UTC).isoformat(), "argv": redact(list(execution_argv), secrets),
-                            "phase": "preparing_python" if isinstance(backend, SandboxManager)
-                                and needs_managed_python(execution_argv, python_environment,
-                                                         skill=_skill_request is not None)
-                                else "dispatching",
-                            "skill_id": _skill_request.skill_id if _skill_request else None}
-                        receipt = self._sandbox_commands.get(command_id, {}) if _operation_id else {}
-                        receipt.update(receipt_data)
-                        peers = tuple({key: item.get(key) for key in ("id", "caller", "run_id", "argv", "started_at")}
-                            for item in self._sandbox_commands.values() if item["sandbox_id"] == sandbox_id and item["id"] != command_id)
-                        self._sandbox_commands[command_id] = receipt
-                        self._sandbox_tasks[command_id] = asyncio.current_task()
-                        save(self, sandbox_id, receipt)
-                    async def recheck_admission() -> None:
-                        # Any asynchronous queue or interpreter preparation can
-                        # outlive the grants and dependency bindings it observed.
-                        async with self._node_mutation(read_only=True):
-                            self._require_card_type(sandbox_id, CardType.SANDBOX)
-                            if agent_id is not None:
-                                from backend.capabilities.projection import authorize_invocation
-                                values = {key: value for key, value in {
-                                    "environment_id": environment_id, "target_id": target_id,
-                                    "skill_id": _skill_request.skill_id if _skill_request else None,
-                                }.items() if value is not None}
-                                kind = "sandbox.run_skill_script" if _skill_request else "sandbox.execute"
-                                authorize_invocation(self, agent_id, f"{kind}:{sandbox_id}", values)
-                            # Re-resolve Pack enablement, declarations and Skill
-                            # contents after asynchronous interpreter preparation.
-                            current_requirements = execution_profile_references(self, agent_id, sandbox_id,
-                                background_job_id=_background_job_id)
-                            if _skill_request is not None:
-                                current_argv, current_mount = resolve_skill_mount(self, agent_id, sandbox_id, _skill_request,
-                                    runtime_requirements=current_requirements)
-                            elif current_requirements:
-                                current_argv, current_mount = bind_command_profiles(self.plugins, current_requirements, argv)
-                            else:
-                                current_argv, current_mount = argv, None
-                            if current_argv != execution_argv or current_mount != options.get('runtime_mount'):
-                                raise SandboxValidationError('Pack environment or Skill changed while this command was preparing; retry the command')
-                            self.resources.artifacts.assert_source_idle(sandbox_id)
-                            self.summoning.assert_admission(sandbox_id)
-                            if sandbox_id in self._sandbox_stopping:
-                                raise SandboxStateError('Sandbox admission is closed while termination cleanup is pending')
-                    if isinstance(backend, SandboxManager):
-                        await backend.wait_for_python_preparation(
-                            sandbox_id, execution_argv, python_environment,
-                            skill=_skill_request is not None,
-                        )
-                        await recheck_admission()
-                    async def mark_command_started() -> None:
-                        # SandboxManager may prepare a new base interpreter after
-                        # the queue wait. Reauthorize at its final dispatch hook.
-                        await recheck_admission()
-                        receipt["phase"] = "executing"
-                        from backend.sandbox.history import save
-                        save(self, sandbox_id, receipt)
-                        await self._emit_sandbox_event(SandboxEvent(sandbox_id, SandboxEventType.COMMAND_STARTED,
-                            {"command_id": command_id, "argv": receipt["argv"], "concurrent_commands": peers}))
-                    if isinstance(backend, SandboxManager):
-                        options["on_command_start"] = mark_command_started
-                    else:
-                        await mark_command_started()
-                    result = await backend.execute(
-                        sandbox_id, execution_argv, timeout_seconds=timeout_seconds or self.world.get_card(sandbox_id).config.get("command_timeout", 6000), **options
-                    )
-                    if self._execution_secrets.get():
-                        from backend.security.redaction import redact
-                        result = replace(result, stdout=redact(result.stdout, self._execution_secrets.get()),
-                            stderr=redact(result.stderr, self._execution_secrets.get()),
-                            argv=tuple(redact(list(result.argv), self._execution_secrets.get())))
-                        for event_type, output in ((SandboxEventType.STDOUT, result.stdout), (SandboxEventType.STDERR, result.stderr)):
-                            if output:
-                                await self._emit_sandbox_event(SandboxEvent(sandbox_id, event_type, {"text": output}))
-                    receipt.update(state="timed_out" if result.timed_out else "cancelled" if result.cancelled else "finished",
-                        stdout=result.stdout[-65536:], stderr=result.stderr[-65536:], exit_code=result.exit_code,
-                        duration_seconds=result.duration_seconds, timed_out=result.timed_out, cancelled=result.cancelled,
-                        termination_reason="timeout" if result.timed_out else "cancelled" if result.cancelled else "exit")
-                    if receipt.get("cancellation_requested"):
-                        receipt.update(cleanup="complete", termination_confirmed=True)
-                    return replace(result, command_id=command_id, concurrent_commands=peers)
-                except asyncio.CancelledError:
-                    if receipt is not None:
-                        receipt.update(state="cancelled", cancelled=True, timed_out=False, termination_reason="cancelled")
-                        if receipt.get("cancellation_requested"):
-                            receipt.update(cleanup="complete", termination_confirmed=True)
-                            return CommandResult(sandbox_id, tuple(receipt["argv"]), -9,
-                                receipt.get("stdout", ""), receipt.get("stderr", ""),
-                                (datetime.now(UTC) - datetime.fromisoformat(receipt["started_at"])).total_seconds(),
-                                cancelled=True, command_id=command_id, concurrent_commands=peers)
-                    raise
-                except Exception as error:
-                    if receipt is not None:
-                        from backend.security.redaction import redact
-                        receipt.update(state="error", error=redact(str(error), self._execution_secrets.get())[:4096])
-                        if receipt.get("cancellation_requested"):
-                            receipt.update(cleanup="failed", termination_confirmed=False, cleanup_error=receipt["error"])
-                            self._sandbox_stopping.add(sandbox_id)
-                    if self._execution_secrets.get():
-                        from backend.errors import DomainError
-                        from backend.security.redaction import redact
-                        error_type = type(error) if isinstance(error, (DomainError, SandboxError)) else SandboxError
-                        raise error_type(redact(str(error), self._execution_secrets.get())) from None
-                    raise
-                finally:
-                    try:
-                        if receipt is not None:
-                            from backend.sandbox.history import save
-                            if receipt["state"] == "running":
-                                receipt.update(state="interrupted", error="Command interrupted")
-                            save(self, sandbox_id, receipt)
-                    finally:
-                        if receipt is not None and _operation_id is None:
-                            self._sandbox_commands.pop(command_id, None)
-                            self._sandbox_tasks.pop(command_id, None)
-                        try:
-                            if receipt is not None:
-                                await self._emit_sandbox_event(SandboxEvent(sandbox_id, SandboxEventType.COMMAND_FINISHED,
-                                    {key: receipt.get(key) for key in ("argv", "caller", "run_id", "state", "exit_code", "duration_seconds", "cancelled", "timed_out")}
-                                    | {"command_id": command_id}))
-                        finally:
-                            if secret_token is not None:
-                                self._execution_secrets.reset(secret_token)
-                            execution_command_id.reset(command_token)
-                            await self._refresh_sandbox_write_mounts(sandbox_id, agent_id=agent_id)
-
-            execution_task = asyncio.create_task(execute_and_refresh())
-            try:
-                return await asyncio.shield(execution_task)
-            except asyncio.CancelledError:
-                if not _keep_on_disconnect:
-                    for command_id, task in self._sandbox_tasks.items():
-                        if task is execution_task:
-                            receipt = self._sandbox_commands[command_id]
-                            receipt.update(cancellation_requested=True, cancellation_reason="caller_cancelled", cleanup="pending")
-                            from backend.sandbox.history import save
-                            save(self, sandbox_id, receipt)
-                    if not execution_task.cancelling():
-                        execution_task.cancel()
-                async def finish():
-                    await asyncio.gather(execution_task, return_exceptions=True)
-                await self._complete_committed(finish())
-                raise
+        return await execute_sandbox(
+            self, sandbox_id, argv, command=command, timeout_seconds=timeout_seconds,
+            agent_id=agent_id, skill_request=_skill_request, background_job_id=_background_job_id,
+            keep_on_disconnect=_keep_on_disconnect, operation_id=_operation_id,
+            environment_id=environment_id, target_id=target_id, python_environment=python_environment, working_directory=_working_directory,
+        )
 
     async def _refresh_sandbox_write_mounts(
         self, sandbox_id: str, *, agent_id: str | None
@@ -3470,7 +3290,17 @@ class ApplicationServices:
         await self.ensure_sandbox_running(sandbox_id, agent_id=agent_id)
         if agent_id is not None:
             self.capabilities.require_sandbox_execute(agent_id, sandbox_id)
-        return await backend.install_python_packages(sandbox_id, requirements)
+        result = await backend.install_python_packages(sandbox_id, requirements)
+        # Reconcile the same durable Pack bootstrap receipts after a successful
+        # explicit retry. Its existing resolver reuses installed packages.
+        self.plugin_bootstrap.enqueue()
+        await asyncio.shield(self.plugin_bootstrap.task)
+        status = await backend.python_status(sandbox_id)
+        if isinstance(status, dict) and not status.get('dependencies', {}).get('ready', True):
+            from backend.sandbox.models import SandboxPreparationError
+            raise SandboxPreparationError(status['dependencies'].get('error') or 'Shared Pack preparation is incomplete')
+        from backend.capabilities.provider import _python_environment_summary
+        return {**result, 'python_environment': _python_environment_summary(status)}
 
     async def publish_sandbox_event(self, event: SandboxEvent) -> None:
         # Service receipts own admission/completion; native events may arrive
@@ -3505,7 +3335,7 @@ class ApplicationServices:
         if command_id:
             payload["command_id"] = command_id
         if current:
-            payload.update(caller=current["caller"], run_id=current.get("run_id"))
+            payload.update(caller=current["caller"], run_id=current.get("run_id"), working_directory=current.get('working_directory', ''))
         active = [dict(item) for item in self._sandbox_commands.values() if item["sandbox_id"] == event.sandbox_id]
         payload["active_commands"] = [{key: item.get(key) for key in ("id", "caller", "run_id", "argv", "started_at")}
             for item in active if item["state"] == "running" and not (event.type == SandboxEventType.COMMAND_FINISHED and item["id"] == command_id)]
@@ -4076,6 +3906,35 @@ class ApplicationServices:
         if default:
             manager.default_runtime_provider_id = provider_id
 
+    def open_runtime_execution(self, node_id, operation_id, *, workspace, home):
+        from backend.agents.execution import RuntimeExecutionRequest
+        from backend.agents.environment import subprocess_environment
+        from backend.execution_config import runtime_environment_defaults
+        node = self.world.get_card(node_id)
+        if self.runtime_execution is None:
+            raise RuntimeUnavailableError("Runtime execution is unavailable")
+        variables, _ = runtime_environment_defaults(self)
+        environment = subprocess_environment(inherit=self.settings.inherit_runtime_environment)
+        runtime_id = node.config.get("runtime_provider_id") or self._require_run_manager().default_runtime_provider_id
+        return self.runtime_execution.open(RuntimeExecutionRequest(
+            node_id, operation_id, Path(workspace), Path(home), environment, variables, runtime_id))
+
+    def runtime_execution_configuration(self, node_id):
+        node = self.world.get_card(node_id)
+        runtime_id = node.config.get("runtime_provider_id") or self._require_run_manager().default_runtime_provider_id
+        if self.runtime_execution is None:
+            return {"mode": "unavailable", "configured": False}
+        return self.runtime_execution.configuration(runtime_id)
+
+    async def _cleanup_run_execution(self, run_id):
+        operations = [self.sandbox_operations.cancel_run(run_id)]
+        if self.runtime_execution is not None:
+            operations.append(self.runtime_execution.close_operation(run_id))
+        results = await asyncio.gather(*operations, return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("Run execution cleanup failed", failures)
+
     def close(self) -> None:
         self.database.close()
 
@@ -4088,6 +3947,7 @@ def create_services(
     sandbox_backend: SandboxBackend | None = None,
     plugins: PluginRegistry | None = None,
     sandbox_registry_factory=None,
+    runtime_execution_provider: RuntimeExecutionProvider | None = None,
 ) -> ApplicationServices:
     settings.data_root.mkdir(parents=True, exist_ok=True)
     for directory in ("projects", "assets", "sandboxes", "database", "logs"):
@@ -4178,6 +4038,11 @@ def create_services(
     from backend.card_state import ScopedStateStore
     services.card_state = ScopedStateStore(services)
     provider = WorldAgentCapabilityProvider(services)
+    from backend.agents.execution import RuntimeExecutionBroker, NativeRuntimeExecutionProvider
+    execution_provider = runtime_execution_provider
+    if execution_provider is None and settings.tenant_scope == LOCAL_TENANT:
+        execution_provider = NativeRuntimeExecutionProvider()
+    services.runtime_execution = RuntimeExecutionBroker(execution_provider, resolve_model=provider.resolve_model)
     services.node_execution = NodeExecutionService(services)
     from backend.sandbox.operations import SandboxOperations
     services.sandbox_operations = SandboxOperations(services)
@@ -4193,7 +4058,8 @@ def create_services(
         plugins=plugin_registry,
         capability_provider=provider,
         state=state,
-        cleanup_execution=services.sandbox_operations.cancel_run,
+        require_managed_execution=settings.tenant_scope != LOCAL_TENANT,
+        cleanup_execution=services._cleanup_run_execution,
         execution_settled=services.node_execution.signal_continuations,
         conversation_event=services._persist_conversation_event,
         default_runtime_provider_id=(
@@ -4250,6 +4116,7 @@ def create_services(
         services.sandbox_backend if isinstance(services.sandbox_backend, SandboxManager) else None)
     if isinstance(services.sandbox_backend, SandboxManager):
         services.sandbox_backend.pack_requirements = services.plugin_bootstrap.requirements
+        services.sandbox_backend.pack_python_status = services.plugin_bootstrap.status
     from backend.packs.installation import PackInstallationManager
     services.pack_installations = PackInstallationManager(settings.data_root, plugin_registry)
     with startup_stage("reconcile Pack resources"):

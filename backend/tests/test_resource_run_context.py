@@ -19,14 +19,18 @@ class ProbeConfig(BaseModel):
     pass
 
 
-@pytest.fixture
-def services(tmp_path):
+@pytest.fixture(params=("sync", "async"))
+def services(tmp_path, request):
     instance = create_services(Settings.for_data_root(tmp_path / 'isolated-profile'))
     instance.run_manager.default_runtime_provider_id = 'core.mock'
     def register(registration):
         def probe(context, arguments):
             return dict(node_id=context.node_id, actor_id=context.actor_id, run_id=context.run_id,
                         argument_run_id=arguments.get('run_id'))
+        async def probe_async(context, arguments):
+            await asyncio.sleep(0)
+            return probe(context, arguments)
+        handler = probe_async if request.param == 'async' else probe
         async def invoke(context, capability, arguments):
             return await context.node_resource_action(capability, 'probe', arguments)
         registration.register_capability(CapabilityDefinition(
@@ -36,7 +40,7 @@ def services(tmp_path):
             id='test.context.probe', label='Context probe', description='Fixture', icon='box', color='#888888',
             deck_id='test.context', deck_label='Fixture', deck_icon='box', default_name='Context probe',
             default_size=(300, 200), default_status='available', statuses=frozenset({'available'}), config_model=ProbeConfig,
-            resource_actions={'probe': NodeResourceAction(probe, capability_kind='test.context.probe')}))
+            resource_actions={'probe': NodeResourceAction(handler, capability_kind='test.context.probe')}))
         registration.register_relationship(RelationshipDefinition(
             id='test.context.access', label='Probe', short_label='probe', description='Fixture',
             source_traits=frozenset({'core.agent'}), target_types=frozenset({'test.context.probe'}),
@@ -59,6 +63,14 @@ def test_existing_positional_context_constructor_remains_compatible(tmp_path):
     resolver = lambda reference: reference
     upstream = NodeResourceContext('card', tmp_path, Event(), 'agent', False, None, None, resolver)
     assert upstream.resolve_model is resolver and upstream.run_id is None
+    open_execution = lambda **options: options
+    configuration = lambda: {"configured": True}
+    files = {}
+    upstream = NodeResourceContext('card', tmp_path, Event(), 'agent', False, None, None,
+                                   resolver, open_execution, configuration, files)
+    assert upstream.resolve_model is resolver and upstream.open_execution is open_execution
+    assert upstream.execution_configuration is configuration and upstream.files is files
+    assert upstream.run_id is None
 
 
 @pytest.mark.asyncio
@@ -86,7 +98,7 @@ async def test_unrelated_run_and_non_agent_resource_calls_do_not_receive_run_ide
 
 
 @pytest.mark.asyncio
-async def test_real_concurrent_runs_on_one_agent_receive_distinct_trusted_ids_in_resource_workers(services, monkeypatch):
+async def test_real_concurrent_runs_on_one_agent_receive_distinct_trusted_ids_in_resource_handlers(services, monkeypatch):
     agent, probe = await setup(services)
     original = MockAgentRuntime.execute
     ready = asyncio.Event()

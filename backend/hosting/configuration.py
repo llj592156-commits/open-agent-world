@@ -53,12 +53,15 @@ class HostedProfile:
     mode: str
     upstream: str
     secret: str = field(repr=False)
+    pack_management: bool = False
 
     def __post_init__(self):
         identifier(self.profile_id)
         identifier(self.user_id)
         if self.mode not in {"builder", "runtime"}:
             raise ValueError("Profile mode must be builder or runtime")
+        if type(self.pack_management) is not bool or self.pack_management and self.mode != 'builder':
+            raise ValueError("Pack management requires an operator-enabled builder")
         if (not isinstance(self.application_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", self.application_id)
                 or not isinstance(self.name, str) or not self.name.strip() or len(self.name) > 120):
             raise ValueError("Application ID and name are required and must be bounded")
@@ -71,7 +74,8 @@ class HostedProfile:
             raise ValueError("Each worker requires an independent secret of 32 to 64 random bytes encoded as hex")
 
     def public(self) -> dict:
-        return {"id": self.profile_id, "application_id": self.application_id, "name": self.name, "mode": self.mode}
+        return {"id": self.profile_id, "application_id": self.application_id, "name": self.name,
+                "mode": self.mode, "pack_management": self.pack_management}
 
 
 @dataclass(frozen=True)
@@ -80,10 +84,16 @@ class GatewaySettings:
     accounts_path: Path
     profiles: tuple[HostedProfile, ...] = ()
     allow_local_http: bool = False
+    shared_models_origin: str | None = None
+    shared_environment_origin: str | None = None
 
     def __post_init__(self):
         public_origin(self.public_origin, self.allow_local_http)
-        for key in ("profile_id", "user_id", "upstream", "secret"):
+        if self.shared_models_origin is not None:
+            public_origin(self.shared_models_origin, allow_local_http=True)
+        if self.shared_environment_origin is not None:
+            public_origin(self.shared_environment_origin, allow_local_http=True)
+        for key in ("profile_id", "upstream", "secret"):
             values = [getattr(profile, key) for profile in self.profiles]
             if key == "secret":
                 values = [value.lower() for value in values]
@@ -99,6 +109,8 @@ def read_gateway_settings(path: Path) -> GatewaySettings:
         value["public_origin"], path.parent / "accounts.sqlite3",
         tuple(HostedProfile(**profile) for profile in value.get("profiles", [])),
         value.get("allow_local_http", False),
+        value.get("shared_models_origin"),
+        value.get("shared_environment_origin"),
     )
 
 
